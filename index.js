@@ -2,14 +2,14 @@ const express = require('express');
 const app = express();
 app.use(express.json());
 
-// === Tes identifiants (déjà validés) ===
+// === Tes identifiants (inchangés) ===
 const ACCESS_TOKEN    = 'EAArXJeZAS1lwBPlzau1ZBK0hr4mE89k0ZCimk2rMZCWv7QR3rhPTWBdntU82QBKtqsGoumaklHt8cFoVyW3Fnl4UBvwBqoRFeYSwdaInpCxJihwHEf3swM62Mu25bRwt7kBS706IxsATHXnMxXIwX1w8vqidhZArY8lbVtIsmERdFIyK5cAiZBFBqqlepaCOWLwsTu9hQNbB1BX2rjb27ZCMOZAxwSsjzKw2egRZBnanyiGuUDN8sxSE1ew8PZCU4ZD';
-const PHONE_NUMBER_ID = '799570023246806'; // ton ID de numéro
-const VERIFY_TOKEN    = 'fitmouv_verify_123'; // le même que sur Meta
+const PHONE_NUMBER_ID = '799570023246806'; // ton ID WhatsApp Business
+const VERIFY_TOKEN    = 'fitmouv_verify_123';
 
-// Petit helper pour envoyer un message
+// 📨 Fonction d’envoi de message WhatsApp
 async function sendWhatsAppMessage(to, body) {
-  const url = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
+  const url = `https://graph.facebook.com/v24.0/${PHONE_NUMBER_ID}/messages`;
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -24,16 +24,17 @@ async function sendWhatsAppMessage(to, body) {
   });
 
   const data = await res.json().catch(() => ({}));
-  console.log('↪️  Réponse Meta:', res.status, JSON.stringify(data));
+  console.log('↪️ Réponse Meta:', res.status, JSON.stringify(data));
+
   if (!res.ok) {
-    throw new Error(`Envoi WhatsApp échec: ${res.status}`);
+    throw new Error(`Échec d’envoi WhatsApp (${res.status})`);
   }
 }
 
-// Healthcheck rapide
-app.get('/', (_req, res) => res.send('OK - Webhook en ligne'));
+// 🚦 Route de test
+app.get('/', (_req, res) => res.send('✅ Webhook FitMouv actif'));
 
-// Vérification du webhook (Meta appelle en GET au setup)
+// 🪪 Vérification du webhook pour Meta
 app.get('/webhook', (req, res) => {
   const mode      = req.query['hub.mode'];
   const token     = req.query['hub.verify_token'];
@@ -44,32 +45,28 @@ app.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
-// Réception des messages (Meta envoie en POST ici)
+// 💬 Réception des messages
 app.post('/webhook', async (req, res) => {
   try {
     const data = req.body;
-    // Confirme tout de suite à Meta
     res.sendStatus(200);
 
-    // Sélectionne le premier message texte s’il existe
     const msg = data?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
     if (!msg) return;
 
-    const from = msg.from;                 // wa_id de l’expéditeur (ex: 336....)
-    const text = msg.text?.body || '';     // contenu du message
-
+    const from = msg.from;
+    const text = msg.text?.body || '';
     console.log('📩 Message reçu de', from, ':', text);
 
-    // On répond (fenêtre 24h ouverte puisqu’il vient d’écrire)
-    const reply = `Merci pour ton message ! Tu as écrit : "${text}"`;
+    // 🔁 Réponse automatique
+    const reply = `Merci pour ton message ! Tu as écrit : « ${text} »`;
     await sendWhatsAppMessage(from, reply);
-
     console.log('✅ Réponse envoyée à', from);
   } catch (err) {
-    console.error('❌ Erreur dans /webhook:', err.message);
+    console.error('❌ Erreur webhook :', err.message);
   }
 });
 
-// Render injecte le port via process.env.PORT
+// 🚀 Lancement du serveur
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('🚀 Serveur lancé sur le port', PORT));
+app.listen(PORT, () => console.log('🚀 Serveur FitMouv lancé sur le port', PORT));
