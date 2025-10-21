@@ -19,6 +19,145 @@ const PROGRAM_DELAY_MAX_MIN  = Number(process.env.PROGRAM_DELAY_MAX_MIN || 1380)
 // contacts: waId -> { sioProfile, history:[{role,text,at}], summary:string, programScheduledAt:number|null, programSent:boolean }
 const contacts = new Map();
 
+// ------- à mettre en haut si pas déjà présent -------
+const fs = require('fs');
+const path = require('path');
+
+// body parsers (JSON + form-urlencoded)
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// ------- helpers stockage JSON léger -------
+const DATA_DIR = path.join('/tmp'); // FS éphémère sur Render (OK pour POC)
+const CLIENTS_PATH = path.join(DATA_DIR, 'clients.json');
+
+function readClients() {
+  try {
+    if (!fs.existsSync(CLIENTS_PATH)) return {};
+    const raw = fs.readFileSync(CLIENTS_PATH, 'utf8');
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    console.error('readClients error:', e);
+    return {};
+  }
+}
+
+function writeClients(db) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(CLIENTS_PATH, JSON.stringify(db, null, 2), 'utf8');
+  } catch (e) {
+    console.error('writeClients error:', e);
+  }
+}
+
+// ------- utilitaires -------
+function pick(v, fallback = '') {
+  if (v === null || v === undefined) return fallback;
+  return String(v).trim();
+}
+function phoneSanitize(p) {
+  // laisse quasi tel quel, on enlève juste espaces
+  return pick(p).replace(/\s+/g, '');
+}
+
+// Envoie d’un texte WhatsApp simple via l’API Meta
+async function sendWhatsAppText(toPhone, text) {
+  try {
+    const url = `https://graph.facebook.com/v24.0/${process.env.PHONE_NUMBER_ID}/messages`;
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.ACCESS_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to: toPhone,
+        text: { body: text }
+      })
+    });
+    const j = await r.json();
+    console.log('Meta send resp:', j);
+    return j;
+  } catch (e) {
+    console.error('sendWhatsAppText error:', e);
+  }
+}
+
+// ------- ROUTE WEBHOOK SYSTEME.IO -------
+// Systeme.io appellera:  POST /sio-webhook?secret=xxxxx
+app.post('/sio-webhook', async (req, res) => {
+  try {
+    // 1) sécurité: secret en query
+    const secretFromQuery = pick(req.query.secret);
+    const expected = pick(process.env.SIO_SECRET);
+    if (!expected || secretFromQuery !== expected) {
+      console.warn('SIO secret invalid');
+      return res.status(403).json({ ok: false });
+    }
+
+    // 2) payload: Systeme.io peut envoyer en JSON ou form-urlencoded
+    const payload = Object.keys(req.body || {}).length ? req.body : {};
+    console.log('SIO raw payload:', payload);
+
+    // 3) mappage champs (adapte aux noms exacts de TON formulaire)
+    // -> mets ici les "name" de tes inputs Systeme.io
+    const lead = {
+      source: 'systeme.io',
+      createdAt: new Date().toISOString(),
+      email:    pick(payload.email || payload.user_email),
+      phone:    phoneSanitize(payload.phone || payload.telephone || payload.whatsapp || payload.phone_number),
+      firstName: pick(payload.first_name || payload.prenom || payload.firstname || payload.firstName),
+      lastName:  pick(payload.last_name || payload.nom || payload.lastname || payload.lastName),
+      objectif:  pick(payload.objectif),
+      niveau:    pick(payload.niveau || payload.level),
+      contraintes: pick(payload.contraintes || payload.constraints),
+      sexe:      pick(payload.sexe || payload.gender),
+      age:       pick(payload.age),
+      poids:     pick(payload.poids || payload.weight),
+      taille:    pick(payload.taille || payload.height),
+      disponibilites: pick(payload.disponibilites || payload.creneaux || payload.availability),
+      materiel:  pick(payload.materiel || payload.equipment),
+      patho:     pick(payload.pathologies || payload.patho),
+      preferences: pick(payload.preferences || payload.aliments_pref),
+      // ajoute ici si tu as d’autres champs…
+      raw: payload // on garde brut pour debug
+    };
+
+    if (!lead.phone) {
+      console.warn('SIO webhook sans téléphone, on ignore.');
+      // On répond quand même 200 à Systeme.io
+      return res.json({ ok: true, stored: false, reason: 'no_phone' });
+    }
+
+    // 4) stockage JSON léger (clé = téléphone)
+    const db = readClients();
+    db[lead.phone] = { ...(db[lead.phone] || {}), ...lead };
+    writeClients(db);
+    console.log('Lead enregistré pour', lead.phone);
+
+    // 5) message de bienvenue automatique WhatsApp
+    // (style humain, prénom, et "attends nos coachs")
+    const prenom = lead.firstName || '👋';
+    const bienvenue =
+`Salut ${prenom} ! 🙌
+
+Merci pour ton inscription. On a bien reçu toutes tes infos — on te prépare un programme **vraiment personnalisé** (sport + nutrition).
+🕒 D’ici **24–48h**, tes coachs te reviennent pour te le présenter et l’ajuster avec toi. 
+
+Si tu as une **contrainte urgente** (blessure, dispo qui change, aliment à éviter), tu peux me l’écrire ici.  
+Sinon, garde juste un œil sur WhatsApp : on s’occupe de toi. 💪`;
+
+    await sendWhatsAppText(lead.phone, bienvenue);
+
+    return res.json({ ok: true, stored: true });
+  } catch (err) {
+    console.error('SIO /sio-webhook error:', err);
+    // Toujours répondre 200 à Systeme.io pour éviter les retries en boucle
+    return res.json({ ok: true, stored: false, error: true });
+  }
+});
 // Exemples de médias (remplace par tes liens hébergés)
 const EXOS_MEDIA = {
   pushups: "https://i.imgur.com/0hYhD6j.gif",
