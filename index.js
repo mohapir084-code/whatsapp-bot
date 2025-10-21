@@ -3,7 +3,7 @@ const app = express();
 app.use(express.json());
 
 // === Tes identifiants (inchangés) ===
-const ACCESS_TOKEN    = 'EAArXJeZAS1lwBPlzau1ZBK0hr4mE89k0ZCimk2rMZCWv7QR3rhPTWBdntU82QBKtqsGoumaklHt8cFoVyW3Fnl4UBvwBqoRFeYSwdaInpCxJihwHEf3swM62Mu25bRwt7kBS706IxsATHXnMxXIwX1w8vqidhZArY8lbVtIsmERdFIyK5cAiZBFBqqlepaCOWLwsTu9hQNbB1BX2rjb27ZCMOZAxwSsjzKw2egRZBnanyiGuUDN8sxSE1ew8PZCU4ZD';
+const ACCESS_TOKEN    = 'EAArXJeZAS1lwBPjxlQWpFddZA4uZAkTr5NZBSzwRJLB1zWlsEjZCVO6ud4FZAEpUwkHcCCaRZAn8SeHcuDhh0ypwRjwaehr1gKE7hkvkZAZCMM2ScK3UtcDLzNs8MR1lpT1RFpJJ5RMckyDtTZBFypZBF8uY7qfDFDudIt0nNqCcHJZAecD2sZClObhmfOLmh5Nb7MwZDZD';
 const PHONE_NUMBER_ID = '799570023246806'; // ton ID WhatsApp Business
 const VERIFY_TOKEN    = 'fitmouv_verify_123';
 
