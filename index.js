@@ -1,34 +1,36 @@
-// ===== fetch compatible CJS =====
+// ===== fetch compatible CJS (node-fetch v3) =====
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 const FormData = require('form-data');
-const express = require('express');
-const bodyParser = require('body-parser');
 
+// ===== core =====
+const express = require('express');
+
+// ===== ENV secrets =====
 const ACCESS_TOKEN    = process.env.ACCESS_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
 const OPENAI_API_KEY  = process.env.OPENAI_API_KEY;
 
-const PORT                   = process.env.PORT || 10000;
-const DELAY_MIN_SEC          = Number(process.env.DELAY_MIN_SEC || 60);
-const DELAY_MAX_SEC          = Number(process.env.DELAY_MAX_SEC || 240);
-const PROGRAM_DELAY_MIN_MIN  = Number(process.env.PROGRAM_DELAY_MIN_MIN || 1200); // 20h
-const PROGRAM_DELAY_MAX_MIN  = Number(process.env.PROGRAM_DELAY_MAX_MIN || 1380); // 23h
+// délais (en secondes / minutes)
+const PORT                  = process.env.PORT || 10000;
+const DELAY_MIN_SEC         = Number(process.env.DELAY_MIN_SEC || 60);
+const DELAY_MAX_SEC         = Number(process.env.DELAY_MAX_SEC || 240);
+const PROGRAM_DELAY_MIN_MIN = Number(process.env.PROGRAM_DELAY_MIN_MIN || 1200); // 20h
+const PROGRAM_DELAY_MAX_MIN = Number(process.env.PROGRAM_DELAY_MAX_MIN || 1380); // 23h
 
-// ===== Mémoire en RAM (POC) =====
-// contacts: waId -> { sioProfile, history:[{role,text,at}], summary:string, programScheduledAt:number|null, programSent:boolean }
-const contacts = new Map();
-
-// ------- à mettre en haut si pas déjà présent -------
-const fs = require('fs');
-const path = require('path');
-
-// body parsers (JSON + form-urlencoded)
+// ===== App Express DOIT être créé avant tout app.use(...) =====
+const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
-// ------- helpers stockage JSON léger -------
-const DATA_DIR = path.join('/tmp'); // FS éphémère sur Render (OK pour POC)
+// ===== Mémoire en RAM (POC) =====
+// contacts: waId -> { sioProfile, history:[{role,text,at}], summary:string, programScheduledAt:number|null, programSent:boolean, _welcomed:boolean }
+const contacts = new Map();
+
+// ------- FS léger pour stocker les leads SIO (/tmp persiste pendant le run Render) -------
+const fs = require('fs');
+const path = require('path');
+const DATA_DIR = path.join('/tmp');
 const CLIENTS_PATH = path.join(DATA_DIR, 'clients.json');
 
 function readClients() {
@@ -41,7 +43,6 @@ function readClients() {
     return {};
   }
 }
-
 function writeClients(db) {
   try {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -52,118 +53,8 @@ function writeClients(db) {
 }
 
 // ------- utilitaires -------
-function pick(v, fallback = '') {
-  if (v === null || v === undefined) return fallback;
-  return String(v).trim();
-}
-function phoneSanitize(p) {
-  // laisse quasi tel quel, on enlève juste espaces
-  return pick(p).replace(/\s+/g, '');
-}
-
-// Envoie d’un texte WhatsApp simple via l’API Meta
-async function sendWhatsAppText(toPhone, text) {
-  try {
-    const url = `https://graph.facebook.com/v24.0/${process.env.PHONE_NUMBER_ID}/messages`;
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.ACCESS_TOKEN}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        to: toPhone,
-        text: { body: text }
-      })
-    });
-    const j = await r.json();
-    console.log('Meta send resp:', j);
-    return j;
-  } catch (e) {
-    console.error('sendWhatsAppText error:', e);
-  }
-}
-
-// ------- ROUTE WEBHOOK SYSTEME.IO -------
-// Systeme.io appellera:  POST /sio-webhook?secret=xxxxx
-app.post('/sio-webhook', async (req, res) => {
-  try {
-    // 1) sécurité: secret en query
-    const secretFromQuery = pick(req.query.secret);
-    const expected = pick(process.env.SIO_SECRET);
-    if (!expected || secretFromQuery !== expected) {
-      console.warn('SIO secret invalid');
-      return res.status(403).json({ ok: false });
-    }
-
-    // 2) payload: Systeme.io peut envoyer en JSON ou form-urlencoded
-    const payload = Object.keys(req.body || {}).length ? req.body : {};
-    console.log('SIO raw payload:', payload);
-
-    // 3) mappage champs (adapte aux noms exacts de TON formulaire)
-    // -> mets ici les "name" de tes inputs Systeme.io
-    const lead = {
-      source: 'systeme.io',
-      createdAt: new Date().toISOString(),
-      email:    pick(payload.email || payload.user_email),
-      phone:    phoneSanitize(payload.phone || payload.telephone || payload.whatsapp || payload.phone_number),
-      firstName: pick(payload.first_name || payload.prenom || payload.firstname || payload.firstName),
-      lastName:  pick(payload.last_name || payload.nom || payload.lastname || payload.lastName),
-      objectif:  pick(payload.objectif),
-      niveau:    pick(payload.niveau || payload.level),
-      contraintes: pick(payload.contraintes || payload.constraints),
-      sexe:      pick(payload.sexe || payload.gender),
-      age:       pick(payload.age),
-      poids:     pick(payload.poids || payload.weight),
-      taille:    pick(payload.taille || payload.height),
-      disponibilites: pick(payload.disponibilites || payload.creneaux || payload.availability),
-      materiel:  pick(payload.materiel || payload.equipment),
-      patho:     pick(payload.pathologies || payload.patho),
-      preferences: pick(payload.preferences || payload.aliments_pref),
-      // ajoute ici si tu as d’autres champs…
-      raw: payload // on garde brut pour debug
-    };
-
-    if (!lead.phone) {
-      console.warn('SIO webhook sans téléphone, on ignore.');
-      // On répond quand même 200 à Systeme.io
-      return res.json({ ok: true, stored: false, reason: 'no_phone' });
-    }
-
-    // 4) stockage JSON léger (clé = téléphone)
-    const db = readClients();
-    db[lead.phone] = { ...(db[lead.phone] || {}), ...lead };
-    writeClients(db);
-    console.log('Lead enregistré pour', lead.phone);
-
-    // 5) message de bienvenue automatique WhatsApp
-    // (style humain, prénom, et "attends nos coachs")
-    const prenom = lead.firstName || '👋';
-    const bienvenue =
-`Salut ${prenom} ! 🙌
-
-Merci pour ton inscription. On a bien reçu toutes tes infos — on te prépare un programme **vraiment personnalisé** (sport + nutrition).
-🕒 D’ici **24–48h**, tes coachs te reviennent pour te le présenter et l’ajuster avec toi. 
-
-Si tu as une **contrainte urgente** (blessure, dispo qui change, aliment à éviter), tu peux me l’écrire ici.  
-Sinon, garde juste un œil sur WhatsApp : on s’occupe de toi. 💪`;
-
-    await sendWhatsAppText(lead.phone, bienvenue);
-
-    return res.json({ ok: true, stored: true });
-  } catch (err) {
-    console.error('SIO /sio-webhook error:', err);
-    // Toujours répondre 200 à Systeme.io pour éviter les retries en boucle
-    return res.json({ ok: true, stored: false, error: true });
-  }
-});
-// Exemples de médias (remplace par tes liens hébergés)
-const EXOS_MEDIA = {
-  pushups: "https://i.imgur.com/0hYhD6j.gif",
-  squats: "https://i.imgur.com/7q5E2iB.gif",
-  plank: "https://i.imgur.com/zV7rpxd.gif",
-};
+const pick = (v, fallback = '') => (v === null || v === undefined ? fallback : String(v).trim());
+const phoneSanitize = p => pick(p).replace(/\s+/g, '');
 
 // ===== Utils WhatsApp =====
 async function waPost(path, payload) {
@@ -176,18 +67,6 @@ async function waPost(path, payload) {
   const txt = await r.text();
   if (!r.ok) throw new Error(`Meta POST ${path} -> ${r.status}: ${txt}`);
   try { return JSON.parse(txt); } catch { return txt; }
-}
-
-async function markAsRead(waId, msgId) {
-  if (!msgId) return;
-  try {
-    await waPost(`${PHONE_NUMBER_ID}/messages`, {
-      messaging_product: 'whatsapp',
-      status: 'read',
-      message_id: msgId,
-      to: waId,
-    });
-  } catch (e) { console.error('markAsRead:', e.message); }
 }
 
 async function sendText(to, body) {
@@ -206,6 +85,18 @@ async function sendImage(to, link, caption = '') {
     type: 'image',
     image: { link, caption }
   });
+}
+
+async function markAsRead(waId, msgId) {
+  if (!msgId) return;
+  try {
+    await waPost(`${PHONE_NUMBER_ID}/messages`, {
+      messaging_product: 'whatsapp',
+      status: 'read',
+      message_id: msgId,
+      to: waId,
+    });
+  } catch (e) { console.error('markAsRead:', e.message); }
 }
 
 // ===== OpenAI helpers =====
@@ -234,7 +125,14 @@ async function transcribeAudio(fileBuffer, filename = 'audio.ogg') {
   return data.text || '';
 }
 
-// ===== Génération des programmes (en FR) =====
+// ===== Exemples de médias (remplace par tes gifs hébergés) =====
+const EXOS_MEDIA = {
+  pushups: "https://i.imgur.com/0hYhD6j.gif",
+  squats:  "https://i.imgur.com/7q5E2iB.gif",
+  plank:   "https://i.imgur.com/zV7rpxd.gif",
+};
+
+// ===== Génération programme =====
 async function generatePrograms(profile, userRequestText) {
   const sys = [
     "Tu es FitMouv, coach SPORT + NUTRITION. Français. Ton chill, clair, bienveillant.",
@@ -248,15 +146,15 @@ async function generatePrograms(profile, userRequestText) {
 Résumé client (mémoire longue):
 ${longSummary || '(pas de résumé long pour le moment)'}
 
-Profil SIO:
+Profil:
 ${JSON.stringify(profile, null, 2)}
 
 Demande: "${userRequestText || 'Prépare un programme complet.'}"
 
 Donne en sortie:
 1) 🎯 Objectif & approche (2-4 lignes)
-2) 🥗 Nutrition (plan 15 jours): détail J1-J3, puis logique de rotation (quantités indicatives).
-3) 🏋️‍♂️ Sport (plan 15 jours): 3 JOURS-TYPE détaillés avec 5-6 exos/jour (échauffement, force, cardio/HIIT, core, mobilité). Indique les exos par NOMS CLAIRS (ex: Pompes, Squats, Planche).
+2) 🥗 Nutrition (plan 15 jours): détail J1-J3 + logique de rotation (quantités indicatives).
+3) 🏋️‍♂️ Sport (plan 15 jours): 3 jours-type détaillés avec 5-6 exos/jour (échauffement, force, cardio/HIIT, core, mobilité). Noms d’exos clairs.
 4) 💡 Conseils d’adhérence (3-5 bullets).
   `.trim();
 
@@ -266,16 +164,16 @@ Donne en sortie:
   ]);
 }
 
-// ===== Mémoire large : dernier 30 + résumé =====
+// ===== Mémoire longue : résumé périodique =====
 async function updateLongSummary(waId) {
   const c = contacts.get(waId);
   if (!c || !c.history) return;
-  if ((c.history.length || 0) % 12 !== 0) return; // résume tous les ~12 messages
+  if ((c.history.length || 0) % 12 !== 0) return;
 
   const transcript = c.history.map(h => `${h.role.toUpperCase()}: ${h.text}`).join('\n');
   const prompt = `
 Tu es un assistant qui résume une conversation client-coach FitMouv.
-Fais un résumé persistant (mémoire longue) très compact mais utile pour le contexte futur.
+Fais un résumé persistant, compact et utile pour le contexte futur.
 `.trim();
 
   const summary = await openaiChat([
@@ -286,38 +184,24 @@ Fais un résumé persistant (mémoire longue) très compact mais utile pour le c
   contacts.set(waId, { ...c, summary });
 }
 
-// ===== Délai humanisé =====
-function randDelayMs() {
-  const min = Math.max(5, DELAY_MIN_SEC);
-  const max = Math.max(min, DELAY_MAX_SEC);
-  const sec = Math.floor(Math.random() * (max - min + 1)) + min;
-  return sec * 1000;
-}
-function randProgramDelayMs() {
-  const min = PROGRAM_DELAY_MIN_MIN;
-  const max = PROGRAM_DELAY_MAX_MIN;
-  const m = Math.floor(Math.random() * (max - min + 1)) + min;
-  return m * 60 * 1000;
-}
+// ===== Délais humanisés =====
+const randDelayMs = () => (Math.floor(Math.random() * (Math.max(DELAY_MAX_SEC, DELAY_MIN_SEC) - DELAY_MIN_SEC + 1)) + DELAY_MIN_SEC) * 1000;
+const randProgramDelayMs = () => (Math.floor(Math.random() * (PROGRAM_DELAY_MAX_MIN - PROGRAM_DELAY_MIN_MIN + 1)) + PROGRAM_DELAY_MIN_MIN) * 60 * 1000;
 
-// ===== Scheduler simple (POC) : envoie les programmes quand l’heure est venue =====
+// ===== Scheduler: envoie le programme quand l’heure est venue =====
 setInterval(async () => {
   const now = Date.now();
   for (const [waId, c] of contacts) {
     if (!c.programSent && c.programScheduledAt && c.programScheduledAt <= now) {
       try {
-        // Génère programme si pas déjà prêt
-        let profile = c.sioProfile || {};
-        profile._summary = c.summary || '';
-
+        const profile = { ...(c.sioProfile || {}), _summary: c.summary || '' };
         const baseText = await generatePrograms(profile, "Prépare le programme sport + nutrition personnalisé.");
-        const delayBeforeSend = randDelayMs();
-        await new Promise(r => setTimeout(r, delayBeforeSend));
+        await new Promise(r => setTimeout(r, randDelayMs()));
 
         await sendText(waId, `🗓️ Comme promis, voici ton programme personnalisé (sport + nutrition) :\n\n${baseText}`);
         await sendImage(waId, EXOS_MEDIA.pushups, "Pompes – exécution");
-        await sendImage(waId, EXOS_MEDIA.squats, "Squats – exécution");
-        await sendImage(waId, EXOS_MEDIA.plank, "Planche – gainage");
+        await sendImage(waId, EXOS_MEDIA.squats,  "Squats – exécution");
+        await sendImage(waId, EXOS_MEDIA.plank,   "Planche – gainage");
 
         contacts.set(waId, { ...c, programSent: true });
       } catch (e) {
@@ -325,16 +209,12 @@ setInterval(async () => {
       }
     }
   }
-}, 60 * 1000); // check toutes les minutes
+}, 60 * 1000);
 
-// ===== App =====
-const app = express();
-app.use(bodyParser.json());
-
-// Healthcheck
+// ===== Healthcheck =====
 app.get('/', (_req, res) => res.send('FitMouv webhook OK'));
 
-// Vérif webhook
+// ===== Vérification Webhook Meta (GET /webhook) =====
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -343,52 +223,70 @@ app.get('/webhook', (req, res) => {
   return res.sendStatus(403);
 });
 
-// Systeme.io → Profil
-app.post('/sio', (req, res) => {
+// ===== Webhook Systeme.io : POST /sio-webhook?secret=xxxxx =====
+app.post('/sio-webhook', async (req, res) => {
   try {
-    const p = req.body || {};
-    const phoneRaw = (p.phone || p.telephone || '').replace(/\D/g, '');
-    if (!phoneRaw) return res.status(400).json({ ok: false, error: 'missing phone' });
-    const waId = phoneRaw.startsWith('33') ? phoneRaw : `33${phoneRaw.replace(/^0/, '')}`;
+    const secretFromQuery = pick(req.query.secret);
+    const expected = pick(process.env.SIO_SECRET);
+    if (!expected || secretFromQuery !== expected) {
+      console.warn('SIO secret invalid');
+      return res.status(403).json({ ok: false });
+    }
 
-    const old = contacts.get(waId) || {};
-    const profile = {
-      firstname: p.firstname || p.first_name || old.firstname || '',
-      lastname:  p.lastname || p.last_name || old.lastname || '',
-      email:     p.email || old.email || '',
-      phone:     waId,
-      age:       p.age || old.age || '',
-      gender:    p.gender || p.sexe || old.gender || '',
-      height_cm: p.height_cm || old.height_cm || '',
-      weight_kg: p.weight_kg || old.weight_kg || '',
-      goal:      p.goal || p.objective || old.goal || '',
-      target_weight: p.target_weight || old.target_weight || '',
-      time_per_day_min: p.time_per_day_min || old.time_per_day_min || '',
-      workouts_per_week: p.workouts_per_week || old.workouts_per_week || '',
-      equipment: p.equipment || old.equipment || '',
-      training_place: p.training_place || old.training_place || '',
-      diet_type: p.diet_type || old.diet_type || '',
-      dislikes:  p.dislikes || old.dislikes || '',
-      allergies: p.allergies || old.allergies || ''
+    const payload = Object.keys(req.body || {}).length ? req.body : {};
+    console.log('SIO raw payload:', payload);
+
+    const lead = {
+      source: 'systeme.io',
+      createdAt: new Date().toISOString(),
+      email:     pick(payload.email || payload.user_email),
+      phone:     phoneSanitize(payload.phone || payload.telephone || payload.whatsapp || payload.phone_number),
+      firstName: pick(payload.first_name || payload.prenom || payload.firstname || payload.firstName),
+      lastName:  pick(payload.last_name || payload.nom || payload.lastname || payload.lastName),
+      objectif:  pick(payload.objectif),
+      niveau:    pick(payload.niveau || payload.level),
+      contraintes: pick(payload.contraintes || payload.constraints),
+      sexe:      pick(payload.sexe || payload.gender),
+      age:       pick(payload.age),
+      poids:     pick(payload.poids || payload.weight),
+      taille:    pick(payload.taille || payload.height),
+      disponibilites: pick(payload.disponibilites || payload.creneaux || payload.availability),
+      materiel:  pick(payload.materiel || payload.equipment),
+      patho:     pick(payload.pathologies || payload.patho),
+      preferences: pick(payload.preferences || payload.aliments_pref),
+      raw: payload
     };
 
-    contacts.set(waId, {
-      ...old,
-      sioProfile: profile,
-      history: old.history || [],
-      summary: old.summary || '',
-      programScheduledAt: old.programScheduledAt || null,
-      programSent: old.programSent || false
-    });
+    if (!lead.phone) {
+      console.warn('SIO webhook sans téléphone, on ignore.');
+      return res.json({ ok: true, stored: false, reason: 'no_phone' });
+    }
 
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error('/sio error:', e);
-    return res.status(500).json({ ok: false });
+    const db = readClients();
+    db[lead.phone] = { ...(db[lead.phone] || {}), ...lead };
+    writeClients(db);
+    console.log('Lead enregistré pour', lead.phone);
+
+    const prenom = lead.firstName || '👋';
+    const bienvenue =
+`Salut ${prenom} ! 🙌
+
+Merci pour ton inscription. On a bien reçu toutes tes infos — on te prépare un programme **vraiment personnalisé** (sport + nutrition).
+🕒 D’ici **24–48h**, tes coachs te reviennent pour te le présenter et l’ajuster avec toi. 
+
+Si tu as une **contrainte urgente** (blessure, dispo qui change, aliment à éviter), tu peux me l’écrire ici.
+Sinon, garde juste un œil sur WhatsApp : on s’occupe de toi. 💪`;
+
+    await sendText(lead.phone, bienvenue);
+
+    return res.json({ ok: true, stored: true });
+  } catch (err) {
+    console.error('SIO /sio-webhook error:', err);
+    return res.json({ ok: true, stored: false, error: true });
   }
 });
 
-// Téléchargement média WhatsApp (vocaux)
+// ===== Téléchargement média WhatsApp (vocaux) =====
 async function downloadWhatsAppMedia(mediaId) {
   const meta1 = await fetch(`https://graph.facebook.com/v24.0/${mediaId}`, {
     headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }
@@ -402,7 +300,7 @@ async function downloadWhatsAppMedia(mediaId) {
   return buf;
 }
 
-// Réception messages WhatsApp
+// ===== Réception messages WhatsApp (POST /webhook) =====
 app.post('/webhook', async (req, res) => {
   try {
     res.sendStatus(200);
@@ -417,7 +315,7 @@ app.post('/webhook', async (req, res) => {
     const msgId = msg.id;
     const type  = msg.type;
 
-    let c = contacts.get(waId) || { history: [], programSent: false, programScheduledAt: null, sioProfile: null, summary: '' };
+    let c = contacts.get(waId) || { history: [], programSent: false, programScheduledAt: null, sioProfile: null, summary: '', _welcomed: false };
     contacts.set(waId, c);
 
     await markAsRead(waId, msgId);
@@ -441,37 +339,32 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
-    // --- Mémorise message
+    // Mémorise message
     c = contacts.get(waId);
     c.history.push({ role: 'user', text: userText, at: Date.now() });
     contacts.set(waId, c);
 
-    // 1) SI PREMIER CONTACT -> ENVOI AUTO WELCOME + PLANIFICATION PROGRAMME (<24h)
+    // Premier contact -> welcome + planification
     if (!c._welcomed) {
       const welcome =
-        "👋 Hello, ici l’équipe FitMouv !\n\n" +
-        "Bonne nouvelle : tu es pris(e) en charge par **tes coachs dédiés** (sport + nutrition). " +
-        "On va préparer ton programme **personnalisé**, et **te recontacter d’ici 48h (généralement sous 24h)** pour le passer avec toi et l’adapter à ta réalité (temps dispo, matériel, préférences).\n\n" +
-        "En attendant, si tu as des contraintes particulières (voyage, horaires, blessures…), dis-le ici pour qu’on en tienne compte 💬";
+"👋 Hello, ici l’équipe FitMouv !\n\n" +
+"Bonne nouvelle : tu es pris(e) en charge par **tes coachs dédiés** (sport + nutrition). " +
+"On prépare ton programme **personnalisé**, et **on te revient d’ici 48h (souvent sous 24h)** pour le passer avec toi et l’ajuster à ta réalité.\n\n" +
+"Si tu as une contrainte urgente (voyage, horaires, blessures…), dis-le ici qu’on en tienne compte 💬";
 
       await sendText(waId, welcome);
 
-      // planifie envoi programme
       const dueAt = Date.now() + randProgramDelayMs();
       contacts.set(waId, { ...c, _welcomed: true, programScheduledAt: dueAt });
-
-      return; // on ne répond rien d’autre maintenant
+      return;
     }
 
-    // 2) POUR LES ÉCHANGES INTERMÉDIAIRES (avant programme)
-    // accusé + délai humanisé + réponse chill contextuelle
+    // Échanges intermédiaires (avant programme)
     await sendText(waId, "👌 Bien noté, je te réponds dans quelques minutes…");
-    const delay = randDelayMs();
-    await new Promise(r => setTimeout(r, delay));
+    await new Promise(r => setTimeout(r, randDelayMs()));
 
-    // Construit contexte IA : résumé + 30 derniers messages
     const last30 = c.history.slice(-30).map(h => ({ role: h.role === 'user' ? 'user' : 'assistant', content: h.text }));
-    const sys = "Tu es FitMouv (FR), coach sport + nutrition. Style chill, empathique, précis. Si le programme n’a pas encore été envoyé, reste en mode conversation: clarifie, poses 1-2 questions utiles max, note les contraintes pour adapter le plan.";
+    const sys = "Tu es FitMouv (FR), coach sport + nutrition. Style chill, empathique, précis. Si le programme n’a pas encore été envoyé, reste en mode conversation: clarifie, pose 1-2 questions utiles max, note les contraintes pour adapter le plan.";
     const mem = c.summary ? `Mémoire longue: ${c.summary}` : 'Pas de mémoire longue.';
 
     const reply = await openaiChat([
@@ -482,7 +375,6 @@ app.post('/webhook', async (req, res) => {
 
     await sendText(waId, reply);
 
-    // mémorise réponse et met à jour résumé parfois
     c = contacts.get(waId);
     c.history.push({ role: 'assistant', text: reply, at: Date.now() });
     contacts.set(waId, c);
@@ -493,5 +385,5 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// Lancement
+// ===== Start server =====
 app.listen(PORT, () => console.log(`Serveur FitMouv lancé sur ${PORT}`));
