@@ -1,3 +1,6 @@
+// rendre fetch dispo en CommonJS avec node-fetch v3
+const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+
 // index.js — FitMouv WhatsApp + OpenAI (v24 Meta + Responses API OpenAI)
 const express = require('express');
 const fetch = require('node-fetch');
