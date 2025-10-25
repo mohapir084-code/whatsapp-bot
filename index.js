@@ -1,3 +1,23 @@
+// === Vérification Webhook Meta ===
+app.get('/webhook', (req, res) => {
+  const verifyToken = process.env.VERIFY_TOKEN;
+
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode && token) {
+    if (mode === 'subscribe' && token === verifyToken) {
+      console.log('✅ Webhook validé avec succès par Meta.');
+      res.status(200).send(challenge);
+    } else {
+      console.error('❌ Vérification échouée : mauvais token.');
+      res.sendStatus(403);
+    }
+  } else {
+    res.sendStatus(400);
+  }
+});
 // ===== fetch compatible CJS =====
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 const FormData = require('form-data');
