@@ -140,7 +140,7 @@ async function markAsRead(waId, msgId) {
  * components: tableau de composants (header/body/button variables si besoin)
  */
 async function sendTemplate(to, templateName, components = [], langPref = WELCOME_TEMPLATE_LANG) {
-  const candidates = [langPref, 'fr', 'fr_FR', 'french'].filter(Boolean);
+  const candidats = ['fr'];
   let lastErr = null;
 
   for (const code of candidates) {
