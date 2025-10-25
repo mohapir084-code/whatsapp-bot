@@ -140,7 +140,7 @@ async function sendTemplate(to, templateName, components = []) {
     type: 'template',
     template: {
       name: templateName,
-      language: { code: 'french' },
+      language: { code: 'fr' },
       components
     }
   };
