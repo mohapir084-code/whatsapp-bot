@@ -1,12 +1,11 @@
 // =======================
-// FitMouv WhatsApp Bot  —  index.js (drop-in)
+// FitMouv WhatsApp Bot - FINAL
 // =======================
 
 // 1) BOOT EXPRESS EN PREMIER
 const express = require('express');
 const app = express();
 
-// Parsers
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -14,7 +13,7 @@ app.use(express.urlencoded({ extended: true }));
 const fs = require('fs');
 const path = require('path');
 const FormData = require('form-data');
-// fetch compatible CJS (évite les conflits Node 22)
+// fetch compatible CJS (évite les conflits avec Node 22)
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 
 // 3) ENV
@@ -46,44 +45,39 @@ app.use((req, res, next) => {
 });
 
 // 5) STOCKAGE LÉGER + MÉMOIRE
-const contacts = new Map(); // waId -> { sioProfile, history:[{role,text,at}], summary, programScheduledAt, programSent, _welcomed, lastUserTs, lastBotTs }
-const DATA_DIR = path.join('/tmp');
-const CLIENTS_PATH = path.join(DATA_DIR, 'clients.json');
+// contacts: waId -> state
+// state: {
+//   sioProfile, history:[{role,text,at}], summary,
+//   programScheduledAt, programSent,
+//   _welcomed, welcomeSentAt,
+//   lastInboundAt, lastOutboundAt,
+//   relanceStage (0..3), relanceSchedule:[t1,t2,t3],
+//   programReadyNoticeSent, pendingProgramText,
+//   lastWindowOpenAt, weeklyEligible:boolean
+// }
+const contacts = new Map();
 
+const DATA_DIR = path.join('/tmp');
+const CLIENTS_PATH = path.join(DATA_DIR, 'clients.json'); // stockage leads SIO (simple)
 function readClients() {
   try {
     if (!fs.existsSync(CLIENTS_PATH)) return {};
     const raw = fs.readFileSync(CLIENTS_PATH, 'utf8');
     return raw ? JSON.parse(raw) : {};
-  } catch (e) {
-    console.error('readClients error:', e);
-    return {};
-  }
+  } catch (e) { console.error('readClients error:', e); return {}; }
 }
 function writeClients(db) {
   try {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.writeFileSync(CLIENTS_PATH, JSON.stringify(db, null, 2), 'utf8');
-  } catch (e) {
-    console.error('writeClients error:', e);
-  }
+  } catch (e) { console.error('writeClients error:', e); }
 }
 
 // 6) UTILS
-const pick = (v, fb = '') => (v === null || v === undefined ? fb : String(v).trim());
+function pick(v, fb = '') { return (v === null || v === undefined) ? fb : String(v).trim(); }
+function phoneSanitize(p) { return pick(p).replace(/\s+/g, ''); }
 
-// garde UNIQUEMENT les chiffres (supprime +, espaces, -, etc.)
-const phoneSanitize = p => pick(p).replace(/\D/g, '');
-
-// construit un waId pleinement numérique en international (FR si besoin)
-function normalizeWaId(input) {
-  const d = phoneSanitize(input);
-  if (!d) return '';
-  if (d.startsWith('33')) return d;         // déjà au bon format FR
-  if (d.startsWith('0')) return '33' + d.slice(1); // 0XXXXXXXXX -> 33XXXXXXXXX
-  if (d.length === 9 && (d[0] === '6' || d[0] === '7')) return '33' + d; // 6/7XXXXXXXX -> 33...
-  return d; // autre pays déjà internationalisé
-}
+function nowMs() { return Date.now(); }
 
 function randDelayMs() {
   const min = Math.max(5, DELAY_MIN_SEC);
@@ -97,14 +91,19 @@ function randProgramDelayMs() {
   const m = Math.floor(Math.random() * (max - min + 1)) + min;
   return m * 60 * 1000;
 }
-const now = () => Date.now();
+
+// “Fenêtre ouverte” WhatsApp = dernier message USER < 24h
+function isWindowOpen(state) {
+  if (!state?.lastInboundAt) return false;
+  return (nowMs() - state.lastInboundAt) < (24 * 60 * 60 * 1000);
+}
 
 // 7) WHATSAPP HELPERS
 async function waPost(path, payload) {
   const url = `https://graph.facebook.com/v24.0/${path}`;
   const r = await fetch(url, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' },
+    headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
   const txt = await r.text();
@@ -122,50 +121,34 @@ async function sendText(to, body) {
     type: 'text',
     text: { body, preview_url: false }
   });
-  console.log('sendText ->', JSON.stringify(resp));
   return resp;
 }
-
 async function sendImage(to, link, caption = '') {
-  const resp = await waPost(`${PHONE_NUMBER_ID}/messages`, {
+  return waPost(`${PHONE_NUMBER_ID}/messages`, {
     messaging_product: 'whatsapp',
     to,
     type: 'image',
     image: { link, caption }
   });
-  console.log('sendImage ->', JSON.stringify(resp));
-  return resp;
 }
 
-async function sendTemplate(to, templateName, variables = [], lang = 'fr') {
-  async function doSend(languageCode) {
-    const payload = {
-      messaging_product: 'whatsapp',
-      to,
-      type: 'template',
-      template: {
-        name: templateName,
-        language: { code: languageCode },
-        components: variables.length
-          ? [{ type: 'body', parameters: variables.map(v => ({ type: 'text', text: String(v) })) }]
-          : []
-      }
-    };
-    const resp = await waPost(`${PHONE_NUMBER_ID}/messages`, payload);
-    console.log(`Template "${templateName}" (${languageCode}) ->`, JSON.stringify(resp));
-    return resp;
-  }
-
-  try {
-    return await doSend(lang);        // ex: fr
-  } catch (e) {
-    console.error(`Template "${templateName}" (${lang}) FAIL:`, e.message);
-    try {
-      return await doSend('fr_FR');   // fallback fr_FR
-    } catch (e2) {
-      console.error(`Template "${templateName}" (fr_FR) FAIL:`, e2.message);
-      throw e2;
+// TEMPLATES (toujours “french”)
+async function sendTemplate(to, templateName, components = []) {
+  const payload = {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'template',
+    template: {
+      name: templateName,
+      language: { code: 'french' },
+      components
     }
+  };
+  try {
+    return await waPost(`${PHONE_NUMBER_ID}/messages`, payload);
+  } catch (e) {
+    console.error(`Template "${templateName}" FAIL: ${e.message}`);
+    throw e;
   }
 }
 
@@ -185,7 +168,7 @@ async function markAsRead(waId, msgId) {
 async function openaiChat(messages, temperature = 0.7) {
   const r = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ model: 'gpt-4o-mini', messages, temperature })
   });
   if (!r.ok) throw new Error(`OpenAI chat ${r.status}: ${await r.text()}`);
@@ -198,7 +181,7 @@ async function transcribeAudio(fileBuffer, filename = 'audio.ogg') {
   form.append('model', 'whisper-1');
   const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
     method: 'POST',
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}` },
     body: form
   });
   if (!r.ok) throw new Error(`OpenAI transcribe ${r.status}: ${await r.text()}`);
@@ -255,43 +238,26 @@ async function updateLongSummary(waId) {
   contacts.set(waId, { ...c, summary });
 }
 
-// 11) TEMPLATES & FENÊTRE
-// nommage tel que validé côté Meta
-const TPL = {
-  welcome:          'fitmouv_welcome_v1',
-  reprise_soft:     'reprise_fitmouv',
-  relance_soft:     'relance_fitmouv',
-  relance_finale:   'fitmouv_relance_finale',   // marketing mais OK
-  check_contact:    'fitmouv_check_contact',
-  pre_programme:    'programme_pret_fitmouv'
-};
-function windowClosed(c) {
-  if (!c) return true;
-  const last = Math.max(c.lastUserTs || 0, c.lastBotTs || 0);
-  // 23h ~ 23*3600*1000 = 82800000
-  return (now() - last) > 82800000;
-}
-
-// 12) SCHEDULER (envoi programme + visuels)
+// 11) ASSETS EXOS
 const EXOS_MEDIA = {
   pushups: "https://i.imgur.com/0hYhD6j.gif",
   squats:  "https://i.imgur.com/7q5E2iB.gif",
   plank:   "https://i.imgur.com/zV7rpxd.gif",
 };
 
+// 12) SCHEDULER (1/min)
 setInterval(async () => {
-  for (const [waId, c] of contacts) {
-    if (!c.programSent && c.programScheduledAt && c.programScheduledAt <= now()) {
-      try {
-        const profile = { ...(c.sioProfile || {}), _summary: c.summary || '' };
+  const t = nowMs();
 
-        // si fenêtre fermée -> template "pre_programme"
-        if (windowClosed(c)) {
-          await sendTemplate(waId, TPL.pre_programme, [profile.firstname || '👋'], 'fr');
-          contacts.set(waId, { ...c, lastBotTs: now() });
-        } else {
-          // fenêtre ouverte -> message texte + visuels
+  for (const [waId, c] of contacts) {
+    // a) Programme prêt (dans notre POC: quand l’horaire arrive)
+    if (!c.programSent && c.programScheduledAt && c.programScheduledAt <= t) {
+      try {
+        // Si fenêtre OUVERTE → envoi direct (IA style texte + images)
+        if (isWindowOpen(c)) {
+          const profile = { ...(c.sioProfile || {}), _summary: c.summary || '' };
           const baseText = await generatePrograms(profile, "Prépare le programme sport + nutrition personnalisé.");
+
           const delayBeforeSend = randDelayMs();
           await new Promise(r => setTimeout(r, delayBeforeSend));
 
@@ -300,13 +266,60 @@ setInterval(async () => {
           await sendImage(waId, EXOS_MEDIA.squats,  "Squats – exécution");
           await sendImage(waId, EXOS_MEDIA.plank,   "Planche – gainage");
 
-          contacts.set(waId, { ...c, lastBotTs: now() });
+          contacts.set(waId, { ...c, programSent: true, lastOutboundAt: t });
+        } else {
+          // Fenêtre FERMÉE → template “programme prêt”
+          if (!c.programReadyNoticeSent) {
+            await sendTemplate(waId, 'programme_pret_fitmouv', []);
+            contacts.set(waId, {
+              ...c,
+              programReadyNoticeSent: true,
+              // on prépare le contenu pour l’envoyer dès qu’il répond
+              pendingProgramText: '__TO_GENERATE__',
+              lastOutboundAt: t
+            });
+          }
         }
-
-        contacts.set(waId, { ...contacts.get(waId), programSent: true });
       } catch (e) {
-        console.error('Scheduler send error:', e.message);
+        console.error('Scheduler program send error:', e.message);
       }
+    }
+
+    // b) Relances automatiques (si fenêtre fermée & aucune réponse)
+    // Stages: 0 -> rien envoyé; 1 -> 24h; 2 -> 72h; 3 -> 7j (final)
+    if (!isWindowOpen(c)) {
+      if (c.relanceSchedule && c.relanceStage < 3) {
+        const due = c.relanceSchedule[c.relanceStage]; // timestamps [t24, t72, t168]
+        if (due && t >= due) {
+          try {
+            if (c.relanceStage === 0) {
+              await sendTemplate(waId, 'relance_fitmouv', []);
+            } else if (c.relanceStage === 1) {
+              await sendTemplate(waId, 'reprise_fitmouv', []);
+            } else if (c.relanceStage === 2) {
+              await sendTemplate(waId, 'fitmouv_relance_finale', []);
+            }
+            contacts.set(waId, { ...c, relanceStage: c.relanceStage + 1, lastOutboundAt: t });
+          } catch (e) {
+            console.error('Relance error:', e.message);
+          }
+        }
+      }
+    }
+
+    // c) Check hebdo (OPTIONNEL): uniquement si fenêtre a été ouverte récemment (≤ 3 jours)
+    // et seulement si elle est fermée au moment du check
+    if (c.weeklyEligible && c.nextWeeklyCheckAt && t >= c.nextWeeklyCheckAt) {
+      const hadRecentOpen = c.lastInboundAt && (t - c.lastInboundAt) <= (3 * 24 * 60 * 60 * 1000);
+      if (!isWindowOpen(c) && hadRecentOpen) {
+        try {
+          await sendTemplate(waId, 'fitmouv_check_contact', []);
+        } catch (e) {
+          console.error('Weekly check error:', e.message);
+        }
+      }
+      // planifie la prochaine vérification une semaine plus tard, mais garde l’éligibilité telle quelle
+      contacts.set(waId, { ...c, nextWeeklyCheckAt: t + (7 * 24 * 60 * 60 * 1000) });
     }
   }
 }, 60 * 1000);
@@ -341,7 +354,7 @@ app.post('/sio-webhook', async (req, res) => {
       source: 'systeme.io',
       createdAt: new Date().toISOString(),
       email:     pick(payload.email || payload.user_email),
-      phone:     pick(payload.phone || payload.telephone || payload.whatsapp || payload.phone_number),
+      phone:     phoneSanitize(payload.phone || payload.telephone || payload.whatsapp || payload.phone_number),
       firstName: pick(payload.first_name || payload.prenom || payload.firstname || payload.firstName),
       lastName:  pick(payload.last_name || payload.nom || payload.lastname || payload.lastName),
       objectif:  pick(payload.objectif),
@@ -358,37 +371,77 @@ app.post('/sio-webhook', async (req, res) => {
       raw: payload
     };
 
-    const waId = normalizeWaId(lead.phone);
-    if (!waId) {
-      console.warn('Bad phone after normalize:', lead.phone);
-      return res.json({ ok: true, stored: false, reason: 'bad_phone' });
+    if (!lead.phone) {
+      console.warn('SIO webhook sans téléphone, on ignore.');
+      return res.json({ ok: true, stored: false, reason: 'no_phone' });
     }
 
-    // Persist JSON simple
+    // stockage léger JSON (lead)
     const db = readClients();
-    db[waId] = { ...(db[waId] || {}), ...lead };
+    db[lead.phone] = { ...(db[lead.phone] || {}), ...lead };
     writeClients(db);
+    console.log('Lead enregistré pour', lead.phone);
 
-    // Mémoire en RAM
-    const prev = contacts.get(waId) || {};
-    contacts.set(waId, { 
-      ...prev, 
-      sioProfile: { ...(prev.sioProfile || {}), ...lead, phone: waId, firstname: lead.firstName, email: lead.email },
-      firstLeadAt: now()
-    });
+    // état en RAM pour orchestration
+    let c = contacts.get(lead.phone) || {};
+    const t = nowMs();
 
-    console.log('Lead enregistré pour', waId);
-
-    // === Envoi immédiat de la TEMPLATE DE BIENVENUE (fenêtre souvent fermée)
+    // Envoi TEMPLATE de bienvenue immédiat (fenêtre fermée)
     try {
-      const r = await sendTemplate(waId, TPL.welcome, [lead.firstName || '👋'], 'fr');
-      console.log('Welcome template sent:', JSON.stringify(r));
-      contacts.set(waId, { ...contacts.get(waId), lastBotTs: now() });
+      await sendTemplate(lead.phone, 'fitmouv_welcome_v1', []);
     } catch (e) {
       console.error('Welcome template error:', e.message);
     }
 
-    // Si l’appel vient d’un <form> (navigateur), redirige vers une page de confirmation
+    // relances programmées: 24h, 72h, 7j (si pas de réponse)
+    const t24  = t + (24 * 60 * 60 * 1000);
+    const t72  = t + (72 * 60 * 60 * 1000);
+    const t168 = t + (168 * 60 * 60 * 1000); // 7 jours
+
+    c = {
+      ...c,
+      sioProfile: {
+        ...((c && c.sioProfile) || {}),
+        firstname: lead.firstName,
+        lastname:  lead.lastName,
+        email:     lead.email,
+        phone:     lead.phone,
+        objectif:  lead.objectif,
+        niveau:    lead.niveau,
+        sexe:      lead.sexe,
+        age:       lead.age,
+        poids:     lead.poids,
+        taille:    lead.taille,
+        disponibilites: lead.disponibilites,
+        materiel:  lead.materiel,
+        patho:     lead.patho,
+        preferences: lead.preferences,
+      },
+      history: c.history || [],
+      summary: c.summary || '',
+
+      _welcomed: true,
+      welcomeSentAt: t,
+
+      lastOutboundAt: t,
+      // si le client répond, on resettra le relanceStage à 0
+      relanceStage: 0,
+      relanceSchedule: [t24, t72, t168],
+
+      // Planification programme 20–23h plus tard
+      programScheduledAt: c.programScheduledAt || (t + randProgramDelayMs()),
+      programSent: c.programSent || false,
+      programReadyNoticeSent: c.programReadyNoticeSent || false,
+      pendingProgramText: c.pendingProgramText || null,
+
+      // Hebdo: on activera weeklyEligible quand il y aura une vraie fenêtre ouverte
+      weeklyEligible: c.weeklyEligible || false,
+      nextWeeklyCheckAt: c.nextWeeklyCheckAt || null
+    };
+
+    contacts.set(lead.phone, c);
+
+    // Redirection propre si appel via <form>
     const acceptsHTML = (req.headers.accept || '').includes('text/html');
     if (acceptsHTML) return res.redirect(302, SIO_THANKS_URL);
 
@@ -399,12 +452,13 @@ app.post('/sio-webhook', async (req, res) => {
   }
 });
 
-// Systeme.io → Profil JSON (si tu veux pousser un profil plus complet)
+// Systeme.io → Profil JSON (optionnel)
 app.post('/sio', (req, res) => {
   try {
     const p = req.body || {};
-    const waId = normalizeWaId(p.phone || p.telephone || '');
-    if (!waId) return res.status(400).json({ ok: false, error: 'missing phone' });
+    const phoneRaw = (p.phone || p.telephone || '').replace(/\D/g, '');
+    if (!phoneRaw) return res.status(400).json({ ok: false, error: 'missing phone' });
+    const waId = phoneRaw.startsWith('33') ? phoneRaw : `33${phoneRaw.replace(/^0/, '')}`;
 
     const old = contacts.get(waId) || {};
     const profile = {
@@ -446,12 +500,12 @@ app.post('/sio', (req, res) => {
 // Téléchargement média WhatsApp (vocaux)
 async function downloadWhatsAppMedia(mediaId) {
   const meta1 = await fetch(`https://graph.facebook.com/v24.0/${mediaId}`, {
-    headers: { Authorization: `Bearer ${ACCESS_TOKEN}` }
+    headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }
   });
   if (!meta1.ok) throw new Error(`media meta ${meta1.status}: ${await meta1.text()}`);
   const { url } = await meta1.json();
 
-  const fileRes = await fetch(url, { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } });
+  const fileRes = await fetch(url, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` } });
   if (!fileRes.ok) throw new Error(`media download ${fileRes.status}: ${await fileRes.text()}`);
   const buf = Buffer.from(await fileRes.arrayBuffer());
   return buf;
@@ -472,7 +526,14 @@ app.post('/webhook', async (req, res) => {
     const msgId = msg.id;
     const type  = msg.type;
 
-    let c = contacts.get(waId) || { history: [], programSent: false, programScheduledAt: null, sioProfile: null, summary: '' };
+    let c = contacts.get(waId) || {
+      history: [],
+      programSent: false,
+      programScheduledAt: null,
+      sioProfile: null,
+      summary: '',
+      relanceStage: 0
+    };
     contacts.set(waId, c);
 
     await markAsRead(waId, msgId);
@@ -493,38 +554,52 @@ app.post('/webhook', async (req, res) => {
       }
     } else {
       await sendText(waId, "Reçu ✅ Dis-moi en texte ce que tu veux qu’on prépare pour toi 💬");
-      contacts.set(waId, { ...contacts.get(waId), lastBotTs: now() });
       return;
     }
 
-    // Mémorise message
+    // Mémorise message et ouvre la fenêtre
+    const t = nowMs();
     c = contacts.get(waId);
-    c.history.push({ role: 'user', text: userText, at: now() });
-    contacts.set(waId, { ...c, lastUserTs: now() });
+    c.history.push({ role: 'user', text: userText, at: t });
+    c.lastInboundAt = t;
+    c.lastWindowOpenAt = t;
+    c.weeklyEligible = true; // il y a eu une fenêtre ouverte récemment
+    if (!c.nextWeeklyCheckAt) c.nextWeeklyCheckAt = t + (7 * 24 * 60 * 60 * 1000);
 
-    // 1) Premier contact → welcome IA + planif programme si pas déjà prévu
-    if (!c._welcomed) {
-      const welcome =
-        "👋 Hello, ici l’équipe FitMouv !\n\n" +
-        "Bonne nouvelle : tu es pris(e) en charge par tes coachs dédiés (sport + nutrition). " +
-        "On va préparer ton programme personnalisé, et te recontacter sous 24–48h pour le passer avec toi et l’adapter à ta réalité.\n\n" +
-        "En attendant, si tu as des contraintes particulières (voyage, horaires, blessures…), dis-le ici 💬";
+    // Reset relances si le client vient de répondre
+    c.relanceStage = 0;
+    c.relanceSchedule = null;
 
-      await sendText(waId, welcome);
+    // Si on avait un programme prêt mais bloqué (fenêtre fermée), envoi maintenant
+    if (c.pendingProgramText === '__TO_GENERATE__' && !c.programSent) {
+      try {
+        const profile = { ...(c.sioProfile || {}), _summary: c.summary || '' };
+        const baseText = await generatePrograms(profile, "Envoie maintenant le programme (fenêtre ré-ouverte).");
+        await sendText(waId, `🗓️ Voici ton programme personnalisé (sport + nutrition) :\n\n${baseText}`);
+        await sendImage(waId, EXOS_MEDIA.pushups, "Pompes – exécution");
+        await sendImage(waId, EXOS_MEDIA.squats,  "Squats – exécution");
+        await sendImage(waId, EXOS_MEDIA.plank,   "Planche – gainage");
 
-      const dueAt = now() + randProgramDelayMs();
-      contacts.set(waId, { ...contacts.get(waId), _welcomed: true, programScheduledAt: dueAt, lastBotTs: now() });
-      return; // stop ici pour le premier message
+        c.programSent = true;
+        c.pendingProgramText = null;
+        c.lastOutboundAt = nowMs();
+        contacts.set(waId, c);
+        return;
+      } catch (e) {
+        console.error('Envoi programme après réouverture erreur:', e.message);
+      }
     }
 
-    // 2) Échanges intermédiaires (IA)
-    await sendText(waId, "👌 Bien noté, je te réponds dans quelques minutes…");
-    const delay = randDelayMs();
-    await new Promise(r => setTimeout(r, delay));
+    // Si le client ré-ouvre après une longue absence, IA demande brièvement l’explication et s’adapte
+    const longAbsence = c.welcomeSentAt && (t - (c.lastOutboundAt || c.welcomeSentAt)) > (72 * 60 * 60 * 1000); // >72h
+    const preface = longAbsence
+      ? "Contente de te revoir ! Tu veux me dire en 2 mots ce qui t’a bloqué ? On s’adapte 👇\n\n"
+      : "";
 
+    // Réponse IA (fenêtre ouverte)
     const last30 = c.history.slice(-30).map(h => ({ role: h.role === 'user' ? 'user' : 'assistant', content: h.text }));
     const mem = c.summary ? `Mémoire longue: ${c.summary}` : 'Pas de mémoire longue.';
-    const sys = "Tu es FitMouv (FR), coach sport + nutrition. Style chill, empathique, précis. Si le programme n’a pas encore été envoyé, reste en conversation: clarifie (1–2 questions max), note les contraintes utiles, pas de promesses médicales.";
+    const sys = "Tu es FitMouv (FR), coach sport + nutrition. Style chill, empathique, précis. Pose max 1-2 questions utiles, puis propose un micro-plan d’action concret. Rappelle qu’il/elle a 2 coachs dédiés.";
 
     const reply = await openaiChat([
       { role: 'system', content: sys },
@@ -532,12 +607,13 @@ app.post('/webhook', async (req, res) => {
       ...last30
     ]);
 
-    await sendText(waId, reply);
+    await sendText(waId, preface + reply);
 
     // Mémorise réponse & MAJ résumé parfois
     c = contacts.get(waId);
-    c.history.push({ role: 'assistant', text: reply, at: now() });
-    contacts.set(waId, { ...c, lastBotTs: now() });
+    c.history.push({ role: 'assistant', text: preface + reply, at: nowMs() });
+    c.lastOutboundAt = nowMs();
+    contacts.set(waId, c);
     updateLongSummary(waId).catch(e => console.error('updateLongSummary:', e.message));
 
   } catch (e) {
@@ -545,5 +621,5 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-// 14) START
-app.listen(PORT, () => console.log(`🚀 Serveur FitMouv lancé sur ${PORT}`));
+// 14) LANCEMENT
+app.listen(PORT, () => console.log(`🚀 FitMouv bot lancé sur ${PORT}`));
