@@ -1,53 +1,43 @@
-// === Vérification Webhook Meta ===
-app.get('/webhook', (req, res) => {
-  const verifyToken = process.env.VERIFY_TOKEN;
+// =======================
+// FitMouv WhatsApp Bot
+// =======================
 
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-
-  if (mode && token) {
-    if (mode === 'subscribe' && token === verifyToken) {
-      console.log('✅ Webhook validé avec succès par Meta.');
-      res.status(200).send(challenge);
-    } else {
-      console.error('❌ Vérification échouée : mauvais token.');
-      res.sendStatus(403);
-    }
-  } else {
-    res.sendStatus(400);
-  }
-});
-// ===== fetch compatible CJS =====
-const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
-const FormData = require('form-data');
+// 1) BOOT EXPRESS EN PREMIER
 const express = require('express');
-const bodyParser = require('body-parser');
-const fs = require('fs');
-const path = require('path');
-
-const ACCESS_TOKEN    = process.env.ACCESS_TOKEN;
-const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
-const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
-const OPENAI_API_KEY  = process.env.OPENAI_API_KEY;
-const SIO_ALLOWED_ORIGIN = process.env.SIO_ALLOWED_ORIGIN || 'https://pay.fitmouv.fr'; // domaine SIO
-
-const PORT                   = process.env.PORT || 10000;
-const DELAY_MIN_SEC          = Number(process.env.DELAY_MIN_SEC || 60);
-const DELAY_MAX_SEC          = Number(process.env.DELAY_MAX_SEC || 240);
-const PROGRAM_DELAY_MIN_MIN  = Number(process.env.PROGRAM_DELAY_MIN_MIN || 1200);
-const PROGRAM_DELAY_MAX_MIN  = Number(process.env.PROGRAM_DELAY_MAX_MIN || 1380);
-
-// ===== App =====
 const app = express();
 
-// ---- CORS global (autorise SIO à appeler ton API) ----
+// Parsers
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// 2) IMPORTS & HELPERS
+const fs = require('fs');
+const path = require('path');
+const FormData = require('form-data');
+// fetch compatible CJS (évite les conflits avec Node 22)
+const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
+
+// 3) ENV
+const ACCESS_TOKEN     = process.env.ACCESS_TOKEN;
+const PHONE_NUMBER_ID  = process.env.PHONE_NUMBER_ID;
+const VERIFY_TOKEN     = process.env.VERIFY_TOKEN || 'fitmouv_verify_123';
+const OPENAI_API_KEY   = process.env.OPENAI_API_KEY;
+const SIO_ALLOWED_ORIGIN = process.env.SIO_ALLOWED_ORIGIN || 'https://pay.fitmouv.fr';
+const SIO_SECRET       = process.env.SIO_SECRET || 'fitmouv_2025_secret_89HGsQ';
+const SIO_THANKS_URL   = process.env.SIO_THANKS_URL || 'https://pay.fitmouv.fr/8cea436d';
+
+const PORT                  = process.env.PORT || 10000;
+const DELAY_MIN_SEC         = Number(process.env.DELAY_MIN_SEC || 60);
+const DELAY_MAX_SEC         = Number(process.env.DELAY_MAX_SEC || 240);
+const PROGRAM_DELAY_MIN_MIN = Number(process.env.PROGRAM_DELAY_MIN_MIN || 1200); // 20h
+const PROGRAM_DELAY_MAX_MIN = Number(process.env.PROGRAM_DELAY_MAX_MIN || 1380); // 23h
+
+// 4) CORS minimal (pour POST direct depuis SIO si jamais)
 app.use((req, res, next) => {
   const origin = req.headers.origin;
   if (!origin || origin === SIO_ALLOWED_ORIGIN) {
     res.setHeader('Access-Control-Allow-Origin', SIO_ALLOWED_ORIGIN);
   }
-  // si tu veux ouvrir à tous (moins sécurisé): res.setHeader('Access-Control-Allow-Origin','*');
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -55,14 +45,8 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- Parsers ----
-app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: true }));
-
-// ===== Mémoire en RAM (POC)
-const contacts = new Map();
-
-// ------- helpers stockage JSON léger -------
+// 5) STOCKAGE LÉGER + MÉMOIRE
+const contacts = new Map(); // waId -> { sioProfile, history:[{role,text,at}], summary, programScheduledAt, programSent, _welcomed }
 const DATA_DIR = path.join('/tmp');
 const CLIENTS_PATH = path.join(DATA_DIR, 'clients.json');
 
@@ -85,7 +69,7 @@ function writeClients(db) {
   }
 }
 
-// ------- utilitaires -------
+// 6) UTILS
 function pick(v, fallback = '') {
   if (v === null || v === undefined) return fallback;
   return String(v).trim();
@@ -93,32 +77,20 @@ function pick(v, fallback = '') {
 function phoneSanitize(p) {
   return pick(p).replace(/\s+/g, '');
 }
-
-// Envoie d’un texte WhatsApp simple via l’API Meta
-async function sendWhatsAppText(toPhone, text) {
-  try {
-    const url = `https://graph.facebook.com/v24.0/${process.env.PHONE_NUMBER_ID}/messages`;
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.ACCESS_TOKEN}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        to: toPhone,
-        text: { body: text }
-      })
-    });
-    const j = await r.json();
-    console.log('Meta send resp:', j);
-    return j;
-  } catch (e) {
-    console.error('sendWhatsAppText error:', e);
-  }
+function randDelayMs() {
+  const min = Math.max(5, DELAY_MIN_SEC);
+  const max = Math.max(min, DELAY_MAX_SEC);
+  const sec = Math.floor(Math.random() * (max - min + 1)) + min;
+  return sec * 1000;
+}
+function randProgramDelayMs() {
+  const min = PROGRAM_DELAY_MIN_MIN;
+  const max = PROGRAM_DELAY_MAX_MIN;
+  const m = Math.floor(Math.random() * (max - min + 1)) + min;
+  return m * 60 * 1000;
 }
 
-// ===== Utils WhatsApp =====
+// 7) WHATSAPP HELPERS
 async function waPost(path, payload) {
   const url = `https://graph.facebook.com/v24.0/${path}`;
   const r = await fetch(url, {
@@ -129,17 +101,6 @@ async function waPost(path, payload) {
   const txt = await r.text();
   if (!r.ok) throw new Error(`Meta POST ${path} -> ${r.status}: ${txt}`);
   try { return JSON.parse(txt); } catch { return txt; }
-}
-async function markAsRead(waId, msgId) {
-  if (!msgId) return;
-  try {
-    await waPost(`${PHONE_NUMBER_ID}/messages`, {
-      messaging_product: 'whatsapp',
-      status: 'read',
-      message_id: msgId,
-      to: waId,
-    });
-  } catch (e) { console.error('markAsRead:', e.message); }
 }
 async function sendText(to, body) {
   return waPost(`${PHONE_NUMBER_ID}/messages`, {
@@ -157,8 +118,19 @@ async function sendImage(to, link, caption = '') {
     image: { link, caption }
   });
 }
+async function markAsRead(waId, msgId) {
+  if (!msgId) return;
+  try {
+    await waPost(`${PHONE_NUMBER_ID}/messages`, {
+      messaging_product: 'whatsapp',
+      status: 'read',
+      message_id: msgId,
+      to: waId,
+    });
+  } catch (e) { console.error('markAsRead:', e.message); }
+}
 
-// ===== OpenAI helpers =====
+// 8) OPENAI HELPERS
 async function openaiChat(messages, temperature = 0.7) {
   const r = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
@@ -183,7 +155,7 @@ async function transcribeAudio(fileBuffer, filename = 'audio.ogg') {
   return data.text || '';
 }
 
-// ===== Génération des programmes (en FR) =====
+// 9) GÉNÉRATION PROGRAMMES
 async function generatePrograms(profile, userRequestText) {
   const sys = [
     "Tu es FitMouv, coach SPORT + NUTRITION. Français. Ton chill, clair, bienveillant.",
@@ -204,8 +176,8 @@ Demande: "${userRequestText || 'Prépare un programme complet.'}"
 
 Donne en sortie:
 1) 🎯 Objectif & approche (2-4 lignes)
-2) 🥗 Nutrition (plan 15 jours): détail J1-J3, puis logique de rotation (quantités indicatives).
-3) 🏋️‍♂️ Sport (plan 15 jours): 3 JOURS-TYPE détaillés avec 5-6 exos/jour (échauffement, force, cardio/HIIT, core, mobilité). Indique les exos par NOMS CLAIRS.
+2) 🥗 Nutrition (plan 15 jours): détail J1-J3 + logique de rotation (quantités indicatives).
+3) 🏋️‍♂️ Sport (plan 15 jours): 3 JOURS-TYPE détaillés (5-6 exos/jour, échauffement/force/cardio/core/mobilité).
 4) 💡 Conseils d’adhérence (3-5 bullets).
   `.trim();
 
@@ -215,7 +187,7 @@ Donne en sortie:
   ]);
 }
 
-// ===== Mémoire large : dernier 30 + résumé =====
+// 10) RÉSUMÉ LONG PONCTUEL
 async function updateLongSummary(waId) {
   const c = contacts.get(waId);
   if (!c || !c.history) return;
@@ -232,42 +204,68 @@ async function updateLongSummary(waId) {
   contacts.set(waId, { ...c, summary });
 }
 
-// ===== Délais =====
-function randDelayMs() {
-  const min = Math.max(5, DELAY_MIN_SEC);
-  const max = Math.max(min, DELAY_MAX_SEC);
-  const sec = Math.floor(Math.random() * (max - min + 1)) + min;
-  return sec * 1000;
-}
-function randProgramDelayMs() {
-  const min = PROGRAM_DELAY_MIN_MIN;
-  const max = PROGRAM_DELAY_MAX_MIN;
-  const m = Math.floor(Math.random() * (max - min + 1)) + min;
-  return m * 60 * 1000;
-}
+// 11) SCHEDULER (envoi programme + visuels)
+const EXOS_MEDIA = {
+  pushups: "https://i.imgur.com/0hYhD6j.gif",
+  squats:  "https://i.imgur.com/7q5E2iB.gif",
+  plank:   "https://i.imgur.com/zV7rpxd.gif",
+};
 
-// ===== ROUTE WEBHOOK SYSTEME.IO (coté navigateur OU règle d’automatisation) =====
+setInterval(async () => {
+  const now = Date.now();
+  for (const [waId, c] of contacts) {
+    if (!c.programSent && c.programScheduledAt && c.programScheduledAt <= now) {
+      try {
+        const profile = { ...(c.sioProfile || {}), _summary: c.summary || '' };
+        const baseText = await generatePrograms(profile, "Prépare le programme sport + nutrition personnalisé.");
+
+        const delayBeforeSend = randDelayMs();
+        await new Promise(r => setTimeout(r, delayBeforeSend));
+
+        await sendText(waId, `🗓️ Comme promis, voici ton programme personnalisé (sport + nutrition) :\n\n${baseText}`);
+        await sendImage(waId, EXOS_MEDIA.pushups, "Pompes – exécution");
+        await sendImage(waId, EXOS_MEDIA.squats,  "Squats – exécution");
+        await sendImage(waId, EXOS_MEDIA.plank,   "Planche – gainage");
+
+        contacts.set(waId, { ...c, programSent: true });
+      } catch (e) {
+        console.error('Scheduler send error:', e.message);
+      }
+    }
+  }
+}, 60 * 1000);
+
+// 12) ENDPOINTS
+
+// Health
+app.get('/', (_req, res) => res.send('FitMouv webhook OK'));
+
+// Vérif Webhook Meta (GET)
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
+  return res.sendStatus(403);
+});
+
+// Systeme.io → Webhook (depuis règle d’automatisation OU <form action=...>)
 app.post('/sio-webhook', async (req, res) => {
   try {
-    // sécurité via secret en query
     const secretFromQuery = pick(req.query.secret);
-    const expected = pick(process.env.SIO_SECRET);
-    if (!expected || secretFromQuery !== expected) {
+    if (!SIO_SECRET || secretFromQuery !== SIO_SECRET) {
       console.warn('SIO secret invalid');
-      // renvoie tout de même 200 pour éviter retry SIO mais indique erreur
       return res.status(200).json({ ok: false, reason: 'bad_secret' });
     }
 
-    // payload (JSON/FIELD)
     const payload = Object.keys(req.body || {}).length ? req.body : {};
     console.log('SIO raw payload:', payload);
 
-    // mapping champs
     const lead = {
       source: 'systeme.io',
       createdAt: new Date().toISOString(),
-      email:    pick(payload.email || payload.user_email),
-      phone:    phoneSanitize(payload.phone || payload.telephone || payload.whatsapp || payload.phone_number),
+      email:     pick(payload.email || payload.user_email),
+      phone:     phoneSanitize(payload.phone || payload.telephone || payload.whatsapp || payload.phone_number),
       firstName: pick(payload.first_name || payload.prenom || payload.firstname || payload.firstName),
       lastName:  pick(payload.last_name || payload.nom || payload.lastname || payload.lastName),
       objectif:  pick(payload.objectif),
@@ -286,34 +284,30 @@ app.post('/sio-webhook', async (req, res) => {
 
     if (!lead.phone) {
       console.warn('SIO webhook sans téléphone, on ignore.');
+      // on répond 200 pour éviter les retries
       return res.json({ ok: true, stored: false, reason: 'no_phone' });
     }
 
-    // stockage
     const db = readClients();
     db[lead.phone] = { ...(db[lead.phone] || {}), ...lead };
     writeClients(db);
     console.log('Lead enregistré pour', lead.phone);
 
-    // message de bienvenue WhatsApp
     const prenom = lead.firstName || '👋';
     const bienvenue =
 `Salut ${prenom} ! 🙌
 
-Merci pour ton inscription. On a bien reçu toutes tes infos — on te prépare un programme **vraiment personnalisé** (sport + nutrition).
-🕒 D’ici **24–48h**, tes coachs te reviennent pour te le présenter et l’ajuster avec toi. 
+Merci pour ton inscription. On a bien reçu toutes tes infos — on te prépare un programme vraiment personnalisé (sport + nutrition).
+🕒 D’ici 24–48h, tes coachs te reviennent pour te le présenter et l’ajuster avec toi. 
 
 Si tu as une contrainte urgente (blessure, dispo qui change, aliment à éviter), écris-la ici.`;
 
-    await sendWhatsAppText(lead.phone, bienvenue);
+    await sendText(lead.phone, bienvenue);
 
-    // Si ça vient d’un <form action=...> (HTML), on peut rediriger proprement:
+    // Si l’appel vient d’un <form> (navigateur), redirige vers une page de confirmation
     const acceptsHTML = (req.headers.accept || '').includes('text/html');
-    if (acceptsHTML) {
-      // redirige vers ta page de confirmation SIO
-      const thanksUrl = process.env.SIO_THANKS_URL || 'https://pay.fitmouv.fr/8cea436d'; 
-      return res.redirect(302, thanksUrl);
-    }
+    if (acceptsHTML) return res.redirect(302, SIO_THANKS_URL);
+
     return res.json({ ok: true, stored: true });
   } catch (err) {
     console.error('SIO /sio-webhook error:', err);
@@ -321,19 +315,7 @@ Si tu as une contrainte urgente (blessure, dispo qui change, aliment à éviter)
   }
 });
 
-// ---- Healthcheck
-app.get('/', (_req, res) => res.send('FitMouv webhook OK'));
-
-// ---- Vérif webhook Meta
-app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
-  return res.sendStatus(403);
-});
-
-// ---- Endpoint /sio (profil JSON) (inchangé)
+// Systeme.io → Profil JSON (si tu veux pousser un profil plus complet)
 app.post('/sio', (req, res) => {
   try {
     const p = req.body || {};
@@ -378,7 +360,107 @@ app.post('/sio', (req, res) => {
   }
 });
 
-// ---- Téléchargement média, réception WA, scheduler… (inchangé: garde tes blocs existants)
+// Téléchargement média WhatsApp (vocaux)
+async function downloadWhatsAppMedia(mediaId) {
+  const meta1 = await fetch(`https://graph.facebook.com/v24.0/${mediaId}`, {
+    headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` }
+  });
+  if (!meta1.ok) throw new Error(`media meta ${meta1.status}: ${await meta1.text()}`);
+  const { url } = await meta1.json();
 
-// Lancement
-app.listen(PORT, () => console.log(`Serveur FitMouv lancé sur ${PORT}`));
+  const fileRes = await fetch(url, { headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}` } });
+  if (!fileRes.ok) throw new Error(`media download ${fileRes.status}: ${await fileRes.text()}`);
+  const buf = Buffer.from(await fileRes.arrayBuffer());
+  return buf;
+}
+
+// Réception messages WhatsApp (POST)
+app.post('/webhook', async (req, res) => {
+  try {
+    res.sendStatus(200);
+
+    const entry = req.body?.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value  = change?.value;
+    const msg    = value?.messages?.[0];
+    if (!msg) return;
+
+    const waId  = msg.from;
+    const msgId = msg.id;
+    const type  = msg.type;
+
+    let c = contacts.get(waId) || { history: [], programSent: false, programScheduledAt: null, sioProfile: null, summary: '' };
+    contacts.set(waId, c);
+
+    await markAsRead(waId, msgId);
+
+    // Texte utilisateur (ou transcription)
+    let userText = '';
+    if (type === 'text') {
+      userText = msg.text.body.trim();
+    } else if (type === 'audio') {
+      try {
+        const mediaId = msg.audio.id;
+        const buf = await downloadWhatsAppMedia(mediaId);
+        userText = await transcribeAudio(buf, 'voice.ogg');
+      } catch (e) {
+        console.error('Transcription vocale erreur:', e.message);
+        await sendText(waId, "J’ai pas réussi à comprendre le vocal 😅 Tu peux réessayer en texte ?");
+        return;
+      }
+    } else {
+      await sendText(waId, "Reçu ✅ Dis-moi en texte ce que tu veux qu’on prépare pour toi 💬");
+      return;
+    }
+
+    // Mémorise message
+    c = contacts.get(waId);
+    c.history.push({ role: 'user', text: userText, at: Date.now() });
+    contacts.set(waId, c);
+
+    // 1) Premier contact → welcome + planif programme
+    if (!c._welcomed) {
+      const welcome =
+        "👋 Hello, ici l’équipe FitMouv !\n\n" +
+        "Bonne nouvelle : tu es pris(e) en charge par tes coachs dédiés (sport + nutrition). " +
+        "On va préparer ton programme personnalisé, et te recontacter sous 24–48h pour le passer avec toi et l’adapter à ta réalité.\n\n" +
+        "En attendant, si tu as des contraintes particulières (voyage, horaires, blessures…), dis-le ici 💬";
+
+      await sendText(waId, welcome);
+
+      const dueAt = Date.now() + randProgramDelayMs();
+      contacts.set(waId, { ...c, _welcomed: true, programScheduledAt: dueAt });
+
+      return; // stop ici pour le premier message
+    }
+
+    // 2) Échanges intermédiaires
+    await sendText(waId, "👌 Bien noté, je te réponds dans quelques minutes…");
+    const delay = randDelayMs();
+    await new Promise(r => setTimeout(r, delay));
+
+    const last30 = c.history.slice(-30).map(h => ({ role: h.role === 'user' ? 'user' : 'assistant', content: h.text }));
+    const mem = c.summary ? `Mémoire longue: ${c.summary}` : 'Pas de mémoire longue.';
+    const sys = "Tu es FitMouv (FR), coach sport + nutrition. Style chill, empathique, précis. Si le programme n’a pas encore été envoyé, reste en conversation: clarifie (1–2 questions max), note les contraintes utiles, pas de promesses médicales.";
+
+    const reply = await openaiChat([
+      { role: 'system', content: sys },
+      { role: 'user', content: mem },
+      ...last30
+    ]);
+
+    await sendText(waId, reply);
+
+    // Mémorise réponse & MAJ résumé parfois
+    c = contacts.get(waId);
+    c.history.push({ role: 'assistant', text: reply, at: Date.now() });
+    contacts.set(waId, c);
+    updateLongSummary(waId).catch(e => console.error('updateLongSummary:', e.message));
+
+  } catch (e) {
+    console.error('Erreur /webhook:', e);
+  }
+});
+
+// 13) START
+app.listen(PORT, () => console.log(`🚀 Serveur FitMouv lancé sur ${PORT}`));
