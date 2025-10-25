@@ -24,7 +24,7 @@ const OPENAI_API_KEY     = process.env.OPENAI_API_KEY;
 const SIO_ALLOWED_ORIGIN = process.env.SIO_ALLOWED_ORIGIN || 'https://pay.fitmouv.fr';
 const SIO_SECRET         = process.env.SIO_SECRET || 'fitmouv_2025_secret_89HGsQ';
 const SIO_THANKS_URL     = process.env.SIO_THANKS_URL || 'https://pay.fitmouv.fr/8cea436d';
-const WELCOME_TEMPLATE_NAME = process.env.WELCOME_TEMPLATE_NAME || 'fitmouv_welcome_v1';
+const WELCOME_TEMPLATE_NAME = process.env.WELCOME_TEMPLATE_NAME || 'fitmouv_welcome';
 const WELCOME_TEMPLATE_LANG = process.env.WELCOME_TEMPLATE_LANG || 'fr';
 
 const PORT                   = process.env.PORT || 10000;
