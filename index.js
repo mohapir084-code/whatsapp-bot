@@ -139,8 +139,11 @@ async function markAsRead(waId, msgId) {
  * On essaie successivement: WELCOME_TEMPLATE_LANG (env), 'fr', 'fr_FR', 'french'
  * components: tableau de composants (header/body/button variables si besoin)
  */
-async function sendTemplate(to, templateName, components = [], langPref = WELCOME_TEMPLATE_LANG) {
-  const candidats = ['fr'];
+// ==========================
+// Envoi d'un template WhatsApp
+// ==========================
+async function sendTemplate(to, templateName, components = [], langPref = 'fr') {
+  const candidates = [langPref, 'fr', 'fr_FR', 'french']; // <== bien défini ici
   let lastErr = null;
 
   for (const code of candidates) {
@@ -155,20 +158,20 @@ async function sendTemplate(to, templateName, components = [], langPref = WELCOM
           components
         }
       };
+
       const res = await waPost(`${PHONE_NUMBER_ID}/messages`, payload);
       console.log(`✅ Template "${templateName}" envoyé à ${to} avec la langue "${code}"`);
-      return { ok: true, code, res };
+      return res;
     } catch (e) {
-      console.error(`❌ Echec template "${templateName}" (${to}) avec code "${code}":`, e.message);
+      console.error(`❌ Échec template "${templateName}" (${to}) avec code "${code}": ${e.message}`);
       lastErr = e;
       continue;
     }
   }
 
-  // si tout a échoué:
-  throw lastErr || new Error(`Impossible d'envoyer le template "${templateName}"`);
+  console.error(`❌ Erreur envoi template accueil: ${lastErr.message}`);
+  throw lastErr;
 }
-
 // Heuristique "fenêtre ouverte" côté bot (approximation locale):
 // - si dernier message UTILISATEUR < 23h -> on considère OPEN
 // - sinon CLOSED (alors on utilise template)
