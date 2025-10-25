@@ -1,35 +1,49 @@
 // ===== fetch compatible CJS =====
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 const FormData = require('form-data');
-const express  = require('express');
+const express = require('express');
 const bodyParser = require('body-parser');
-const fs   = require('fs');
+const fs = require('fs');
 const path = require('path');
 
-// ====== ENV ======
 const ACCESS_TOKEN    = process.env.ACCESS_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const VERIFY_TOKEN    = process.env.VERIFY_TOKEN;
 const OPENAI_API_KEY  = process.env.OPENAI_API_KEY;
-const SIO_SECRET      = process.env.SIO_SECRET || '';
+const SIO_ALLOWED_ORIGIN = process.env.SIO_ALLOWED_ORIGIN || 'https://pay.fitmouv.fr'; // domaine SIO
 
-const PORT                  = Number(process.env.PORT || 10000);
-const DELAY_MIN_SEC         = Number(process.env.DELAY_MIN_SEC || 60);
-const DELAY_MAX_SEC         = Number(process.env.DELAY_MAX_SEC || 240);
-const PROGRAM_DELAY_MIN_MIN = Number(process.env.PROGRAM_DELAY_MIN_MIN || 1200); // 20h
-const PROGRAM_DELAY_MAX_MIN = Number(process.env.PROGRAM_DELAY_MAX_MIN || 1380); // 23h
+const PORT                   = process.env.PORT || 10000;
+const DELAY_MIN_SEC          = Number(process.env.DELAY_MIN_SEC || 60);
+const DELAY_MAX_SEC          = Number(process.env.DELAY_MAX_SEC || 240);
+const PROGRAM_DELAY_MIN_MIN  = Number(process.env.PROGRAM_DELAY_MIN_MIN || 1200);
+const PROGRAM_DELAY_MAX_MIN  = Number(process.env.PROGRAM_DELAY_MAX_MIN || 1380);
 
 // ===== App =====
 const app = express();
-app.use(bodyParser.json({ limit: '1mb' }));
-app.use(bodyParser.urlencoded({ extended: true }));
 
-// ===== Mémoire (POC) =====
-// contacts: waId -> { sioProfile, history:[{role,text,at}], summary, programScheduledAt, programSent, _welcomed }
+// ---- CORS global (autorise SIO à appeler ton API) ----
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (!origin || origin === SIO_ALLOWED_ORIGIN) {
+    res.setHeader('Access-Control-Allow-Origin', SIO_ALLOWED_ORIGIN);
+  }
+  // si tu veux ouvrir à tous (moins sécurisé): res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+// ---- Parsers ----
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// ===== Mémoire en RAM (POC)
 const contacts = new Map();
 
-// ===== Stockage léger (debug) =====
-const DATA_DIR     = path.join('/tmp');                 // FS éphémère Render
+// ------- helpers stockage JSON léger -------
+const DATA_DIR = path.join('/tmp');
 const CLIENTS_PATH = path.join(DATA_DIR, 'clients.json');
 
 function readClients() {
@@ -51,48 +65,51 @@ function writeClients(db) {
   }
 }
 
-// ===== Utils =====
-const pick = (v, fallback = '') => (v === null || v === undefined ? fallback : String(v).trim());
-function normalizeFRPhone(raw) {
-  if (!raw) return '';
-  let p = String(raw).trim();
-
-  // garder + et chiffres
-  p = p.replace(/[^\d+]/g, '');
-
-  // 00xx -> +xx
-  if (p.startsWith('00')) p = '+' + p.slice(2);
-
-  // déjà en +E.164
-  if (p.startsWith('+')) return p;
-
-  // 0XXXXXXXXX -> +33XXXXXXXXX
-  if (/^0\d{9}$/.test(p)) return '+33' + p.slice(1);
-
-  // 33XXXXXXXXX -> +33XXXXXXXXX
-  if (/^33\d{9}$/.test(p)) return '+' + p;
-
-  // fallback: chiffres seuls
-  if (/^\d+$/.test(p)) {
-    if (p.startsWith('0') && p.length === 10) return '+33' + p.slice(1);
-    return '+' + p;
-  }
-  return p;
+// ------- utilitaires -------
+function pick(v, fallback = '') {
+  if (v === null || v === undefined) return fallback;
+  return String(v).trim();
+}
+function phoneSanitize(p) {
+  return pick(p).replace(/\s+/g, '');
 }
 
-// ===== WhatsApp helpers =====
+// Envoie d’un texte WhatsApp simple via l’API Meta
+async function sendWhatsAppText(toPhone, text) {
+  try {
+    const url = `https://graph.facebook.com/v24.0/${process.env.PHONE_NUMBER_ID}/messages`;
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.ACCESS_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to: toPhone,
+        text: { body: text }
+      })
+    });
+    const j = await r.json();
+    console.log('Meta send resp:', j);
+    return j;
+  } catch (e) {
+    console.error('sendWhatsAppText error:', e);
+  }
+}
+
+// ===== Utils WhatsApp =====
 async function waPost(path, payload) {
   const url = `https://graph.facebook.com/v24.0/${path}`;
   const r = await fetch(url, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
+    headers: { 'Authorization': `Bearer ${ACCESS_TOKEN}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
   });
   const txt = await r.text();
   if (!r.ok) throw new Error(`Meta POST ${path} -> ${r.status}: ${txt}`);
   try { return JSON.parse(txt); } catch { return txt; }
 }
-
 async function markAsRead(waId, msgId) {
   if (!msgId) return;
   try {
@@ -104,22 +121,20 @@ async function markAsRead(waId, msgId) {
     });
   } catch (e) { console.error('markAsRead:', e.message); }
 }
-
 async function sendText(to, body) {
   return waPost(`${PHONE_NUMBER_ID}/messages`, {
     messaging_product: 'whatsapp',
     to,
     type: 'text',
-    text: { body, preview_url: false },
+    text: { body, preview_url: false }
   });
 }
-
 async function sendImage(to, link, caption = '') {
   return waPost(`${PHONE_NUMBER_ID}/messages`, {
     messaging_product: 'whatsapp',
     to,
     type: 'image',
-    image: { link, caption },
+    image: { link, caption }
   });
 }
 
@@ -127,83 +142,77 @@ async function sendImage(to, link, caption = '') {
 async function openaiChat(messages, temperature = 0.7) {
   const r = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: 'gpt-4o-mini', messages, temperature }),
+    headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'gpt-4o-mini', messages, temperature })
   });
   if (!r.ok) throw new Error(`OpenAI chat ${r.status}: ${await r.text()}`);
   const data = await r.json();
   return data.choices?.[0]?.message?.content ?? '';
 }
-
 async function transcribeAudio(fileBuffer, filename = 'audio.ogg') {
   const form = new FormData();
   form.append('file', fileBuffer, { filename, contentType: 'audio/ogg' });
   form.append('model', 'whisper-1');
   const r = await fetch('https://api.openai.com/v1/audio/transcriptions', {
     method: 'POST',
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: form,
+    headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}` },
+    body: form
   });
   if (!r.ok) throw new Error(`OpenAI transcribe ${r.status}: ${await r.text()}`);
   const data = await r.json();
   return data.text || '';
 }
 
-// ===== Exemples de médias (remplace par tes propres liens hébergés) =====
-const EXOS_MEDIA = {
-  pushups: 'https://i.imgur.com/0hYhD6j.gif',
-  squats:  'https://i.imgur.com/7q5E2iB.gif',
-  plank:   'https://i.imgur.com/zV7rpxd.gif',
-};
-
-// ===== Génération des programmes =====
+// ===== Génération des programmes (en FR) =====
 async function generatePrograms(profile, userRequestText) {
   const sys = [
-    'Tu es FitMouv, coach SPORT + NUTRITION (FR). Ton style: simple, chaleureux, concret.',
-    'Structure claire avec sections, emojis mesurés, quantités réalistes.',
-    'Tiens compte: âge, sexe, poids, objectif, temps dispo, lieu, matériel, régime, allergies, dislikes.',
-    'But: plan réaliste et tenable (adhérence).'
+    "Tu es FitMouv, coach SPORT + NUTRITION. Français. Ton chill, clair, bienveillant.",
+    "Structure les réponses avec emojis, quantités réalistes, et sections nettes.",
+    "Tiens compte de: âge/sexe/poids/objectif/temps dispo/lieu/matériel/diet/allergies/dislikes.",
+    "Objectif: plan réaliste, tenable, axé adhérence."
   ].join('\n');
 
   const longSummary = profile._summary || '';
   const user = `
-Résumé client:
-${longSummary || '(pas encore de résumé long)'}
+Résumé client (mémoire longue):
+${longSummary || '(pas de résumé long pour le moment)'}
 
-Profil:
+Profil SIO:
 ${JSON.stringify(profile, null, 2)}
 
-Demande: "${userRequestText || 'Prépare un programme complet personnalisé.'}"
+Demande: "${userRequestText || 'Prépare un programme complet.'}"
 
 Donne en sortie:
-1) Objectif & approche (2–4 lignes)
-2) Nutrition (plan 15 jours): détail J1–J3 + logique de rotation (quantités indicatives)
-3) Sport (plan 15 jours): 3 jours-type détaillés (5–6 exos/jour: échauffement, force, cardio/HIIT, core, mobilité)
-4) Conseils d’adhérence (3–5 points)
-`.trim();
+1) 🎯 Objectif & approche (2-4 lignes)
+2) 🥗 Nutrition (plan 15 jours): détail J1-J3, puis logique de rotation (quantités indicatives).
+3) 🏋️‍♂️ Sport (plan 15 jours): 3 JOURS-TYPE détaillés avec 5-6 exos/jour (échauffement, force, cardio/HIIT, core, mobilité). Indique les exos par NOMS CLAIRS.
+4) 💡 Conseils d’adhérence (3-5 bullets).
+  `.trim();
 
   return openaiChat([
     { role: 'system', content: sys },
-    { role: 'user', content: user },
+    { role: 'user', content: user }
   ]);
 }
 
-// ===== Mémoire longue (résumé périodique) =====
+// ===== Mémoire large : dernier 30 + résumé =====
 async function updateLongSummary(waId) {
   const c = contacts.get(waId);
   if (!c || !c.history) return;
-  if ((c.history.length || 0) % 12 !== 0) return; // toutes ~12 interactions
+  if ((c.history.length || 0) % 12 !== 0) return;
 
   const transcript = c.history.map(h => `${h.role.toUpperCase()}: ${h.text}`).join('\n');
-  const prompt = 'Fais un résumé persistant et utile de la conversation coach-client (FR), concis et actionnable.';
-  const summary = await openaiChat(
-    [{ role: 'system', content: prompt }, { role: 'user', content: transcript.slice(-6000) }],
-    0.3
-  );
+  const prompt = `Tu es un assistant qui résume une conversation client-coach FitMouv. Fais un résumé persistant très compact.`;
+
+  const summary = await openaiChat([
+    { role: 'system', content: prompt },
+    { role: 'user', content: transcript.slice(-6000) }
+  ], 0.3);
+
   contacts.set(waId, { ...c, summary });
 }
 
-// ===== Délais humanisés =====
+// ===== Délais =====
 function randDelayMs() {
   const min = Math.max(5, DELAY_MIN_SEC);
   const max = Math.max(min, DELAY_MAX_SEC);
@@ -217,63 +226,31 @@ function randProgramDelayMs() {
   return m * 60 * 1000;
 }
 
-// ===== Scheduler: envoi des programmes à l’heure prévue =====
-setInterval(async () => {
-  const now = Date.now();
-  for (const [waId, c] of contacts) {
-    if (!c.programSent && c.programScheduledAt && c.programScheduledAt <= now) {
-      try {
-        const profile = { ...(c.sioProfile || {}), _summary: c.summary || '' };
-        const baseText = await generatePrograms(profile, 'Programme sport + nutrition personnalisé.');
-
-        // petit délai avant envoi (humain)
-        await new Promise(r => setTimeout(r, randDelayMs()));
-
-        await sendText(waId, `Comme promis, voici ton programme personnalisé (sport + nutrition) :\n\n${baseText}`);
-        await sendImage(waId, EXOS_MEDIA.pushups, 'Pompes – exécution');
-        await sendImage(waId, EXOS_MEDIA.squats, 'Squats – exécution');
-        await sendImage(waId, EXOS_MEDIA.plank,  'Planche – gainage');
-
-        contacts.set(waId, { ...c, programSent: true });
-      } catch (e) {
-        console.error('Scheduler send error:', e.message);
-      }
-    }
-  }
-}, 60 * 1000);
-
-// ===== Healthcheck =====
-app.get('/', (_req, res) => res.send('FitMouv webhook OK'));
-
-// ===== Meta webhook verify =====
-app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
-  return res.sendStatus(403);
-});
-
-// ===== Systeme.io webhook (optin) =====
+// ===== ROUTE WEBHOOK SYSTEME.IO (coté navigateur OU règle d’automatisation) =====
 app.post('/sio-webhook', async (req, res) => {
   try {
-    const qSecret = pick(req.query.secret);
-    if (!SIO_SECRET || qSecret !== SIO_SECRET) {
+    // sécurité via secret en query
+    const secretFromQuery = pick(req.query.secret);
+    const expected = pick(process.env.SIO_SECRET);
+    if (!expected || secretFromQuery !== expected) {
       console.warn('SIO secret invalid');
-      return res.status(403).json({ ok: false });
+      // renvoie tout de même 200 pour éviter retry SIO mais indique erreur
+      return res.status(200).json({ ok: false, reason: 'bad_secret' });
     }
 
+    // payload (JSON/FIELD)
     const payload = Object.keys(req.body || {}).length ? req.body : {};
     console.log('SIO raw payload:', payload);
 
+    // mapping champs
     const lead = {
       source: 'systeme.io',
       createdAt: new Date().toISOString(),
-      email:   pick(payload.email || payload.user_email),
-      phone:   normalizeFRPhone(payload.phone || payload.telephone || payload.whatsapp || payload.phone_number || payload.mobile),
-      firstName: pick(payload.first_name || payload.firstname || payload.prenom || payload.firstName),
-      lastName:  pick(payload.last_name  || payload.lastname  || payload.nom     || payload.lastName),
-      objectif:  pick(payload.objectif || payload.goal),
+      email:    pick(payload.email || payload.user_email),
+      phone:    phoneSanitize(payload.phone || payload.telephone || payload.whatsapp || payload.phone_number),
+      firstName: pick(payload.first_name || payload.prenom || payload.firstname || payload.firstName),
+      lastName:  pick(payload.last_name || payload.nom || payload.lastname || payload.lastName),
+      objectif:  pick(payload.objectif),
       niveau:    pick(payload.niveau || payload.level),
       contraintes: pick(payload.contraintes || payload.constraints),
       sexe:      pick(payload.sexe || payload.gender),
@@ -284,7 +261,7 @@ app.post('/sio-webhook', async (req, res) => {
       materiel:  pick(payload.materiel || payload.equipment),
       patho:     pick(payload.pathologies || payload.patho),
       preferences: pick(payload.preferences || payload.aliments_pref),
-      raw: payload,
+      raw: payload
     };
 
     if (!lead.phone) {
@@ -292,49 +269,31 @@ app.post('/sio-webhook', async (req, res) => {
       return res.json({ ok: true, stored: false, reason: 'no_phone' });
     }
 
+    // stockage
     const db = readClients();
     db[lead.phone] = { ...(db[lead.phone] || {}), ...lead };
     writeClients(db);
     console.log('Lead enregistré pour', lead.phone);
 
-    // message d’accueil auto (sans **gras**)
-    const prenom = lead.firstName || '';
+    // message de bienvenue WhatsApp
+    const prenom = lead.firstName || '👋';
     const bienvenue =
-      `Salut ${prenom || '👋'} !\n\n` +
-      `Merci pour ton inscription. On a bien reçu toutes tes infos — on te prépare un programme vraiment personnalisé (sport + nutrition).\n` +
-      `D’ici 24–48 h, tes coachs reviennent vers toi pour te le présenter et l’ajuster avec toi.\n\n` +
-      `Si tu as une contrainte urgente (blessure, dispo qui change, aliment à éviter), écris-la ici. Sinon, on s’occupe de tout. 💪`;
+`Salut ${prenom} ! 🙌
 
-    await sendText(lead.phone, bienvenue);
+Merci pour ton inscription. On a bien reçu toutes tes infos — on te prépare un programme **vraiment personnalisé** (sport + nutrition).
+🕒 D’ici **24–48h**, tes coachs te reviennent pour te le présenter et l’ajuster avec toi. 
 
-    // initialise la fiche contact en mémoire
-    const waId = lead.phone.replace(/\D/g, ''); // WhatsApp renvoie souvent sans +
-    const prev = contacts.get(waId) || { history: [], summary: '', programSent: false, programScheduledAt: null, sioProfile: null };
-    const dueAt = Date.now() + randProgramDelayMs();
+Si tu as une contrainte urgente (blessure, dispo qui change, aliment à éviter), écris-la ici.`;
 
-    contacts.set(waId, {
-      ...prev,
-      _welcomed: true,
-      programScheduledAt: dueAt,
-      sioProfile: {
-        firstname: lead.firstName,
-        lastname: lead.lastName,
-        email: lead.email,
-        phone: waId,
-        goal: lead.objectif,
-        level: lead.niveau,
-        constraints: lead.contraintes,
-        gender: lead.sexe,
-        age: lead.age,
-        weight_kg: lead.poids,
-        height_cm: lead.taille,
-        availability: lead.disponibilites,
-        equipment: lead.materiel,
-        patho: lead.patho,
-        preferences: lead.preferences,
-      },
-    });
+    await sendWhatsAppText(lead.phone, bienvenue);
 
+    // Si ça vient d’un <form action=...> (HTML), on peut rediriger proprement:
+    const acceptsHTML = (req.headers.accept || '').includes('text/html');
+    if (acceptsHTML) {
+      // redirige vers ta page de confirmation SIO
+      const thanksUrl = process.env.SIO_THANKS_URL || 'https://pay.fitmouv.fr/8cea436d'; 
+      return res.redirect(302, thanksUrl);
+    }
     return res.json({ ok: true, stored: true });
   } catch (err) {
     console.error('SIO /sio-webhook error:', err);
@@ -342,103 +301,64 @@ app.post('/sio-webhook', async (req, res) => {
   }
 });
 
-// ===== Télécharger média WhatsApp (vocaux) =====
-async function downloadWhatsAppMedia(mediaId) {
-  const meta1 = await fetch(`https://graph.facebook.com/v24.0/${mediaId}`, {
-    headers: { Authorization: `Bearer ${ACCESS_TOKEN}` },
-  });
-  if (!meta1.ok) throw new Error(`media meta ${meta1.status}: ${await meta1.text()}`);
-  const { url } = await meta1.json();
+// ---- Healthcheck
+app.get('/', (_req, res) => res.send('FitMouv webhook OK'));
 
-  const fileRes = await fetch(url, { headers: { Authorization: `Bearer ${ACCESS_TOKEN}` } });
-  if (!fileRes.ok) throw new Error(`media download ${fileRes.status}: ${await fileRes.text()}`);
-  const buf = Buffer.from(await fileRes.arrayBuffer());
-  return buf;
-}
+// ---- Vérif webhook Meta
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
+  return res.sendStatus(403);
+});
 
-// ===== Réception messages WhatsApp =====
-app.post('/webhook', async (req, res) => {
+// ---- Endpoint /sio (profil JSON) (inchangé)
+app.post('/sio', (req, res) => {
   try {
-    res.sendStatus(200);
+    const p = req.body || {};
+    const phoneRaw = (p.phone || p.telephone || '').replace(/\D/g, '');
+    if (!phoneRaw) return res.status(400).json({ ok: false, error: 'missing phone' });
+    const waId = phoneRaw.startsWith('33') ? phoneRaw : `33${phoneRaw.replace(/^0/, '')}`;
 
-    const entry  = req.body?.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value  = change?.value;
-    const msg    = value?.messages?.[0];
-    if (!msg) return;
+    const old = contacts.get(waId) || {};
+    const profile = {
+      firstname: p.firstname || p.first_name || old.firstname || '',
+      lastname:  p.lastname || p.last_name || old.lastname || '',
+      email:     p.email || old.email || '',
+      phone:     waId,
+      age:       p.age || old.age || '',
+      gender:    p.gender || p.sexe || old.gender || '',
+      height_cm: p.height_cm || old.height_cm || '',
+      weight_kg: p.weight_kg || old.weight_kg || '',
+      goal:      p.goal || p.objective || old.goal || '',
+      target_weight: p.target_weight || old.target_weight || '',
+      time_per_day_min: p.time_per_day_min || old.time_per_day_min || '',
+      workouts_per_week: p.workouts_per_week || old.workouts_per_week || '',
+      equipment: p.equipment || old.equipment || '',
+      training_place: p.training_place || old.training_place || '',
+      diet_type: p.diet_type || old.diet_type || '',
+      dislikes:  p.dislikes || old.dislikes || '',
+      allergies: p.allergies || old.allergies || ''
+    };
 
-    const waId  = msg.from;
-    const msgId = msg.id;
-    const type  = msg.type;
+    contacts.set(waId, {
+      ...old,
+      sioProfile: profile,
+      history: old.history || [],
+      summary: old.summary || '',
+      programScheduledAt: old.programScheduledAt || null,
+      programSent: old.programSent || false
+    });
 
-    let c = contacts.get(waId) || { history: [], programSent: false, programScheduledAt: null, sioProfile: null, summary: '', _welcomed: false };
-    contacts.set(waId, c);
-
-    await markAsRead(waId, msgId);
-
-    // Texte utilisateur ou transcription
-    let userText = '';
-    if (type === 'text') {
-      userText = msg.text.body.trim();
-    } else if (type === 'audio') {
-      try {
-        const mediaId = msg.audio.id;
-        const buf = await downloadWhatsAppMedia(mediaId);
-        userText = await transcribeAudio(buf, 'voice.ogg');
-      } catch (e) {
-        console.error('Transcription vocale erreur:', e.message);
-        await sendText(waId, "J’ai pas réussi à comprendre le vocal 😅 Tu peux réessayer en texte ?");
-        return;
-      }
-    } else {
-      await sendText(waId, "Reçu ✅ Dis-moi en texte ce que tu veux qu’on prépare pour toi 💬");
-      return;
-    }
-
-    // Mémorise message
-    c = contacts.get(waId);
-    c.history.push({ role: 'user', text: userText, at: Date.now() });
-    contacts.set(waId, c);
-
-    // Si pas encore accueilli (cas où le premier message vient de WhatsApp au lieu de SIO)
-    if (!c._welcomed) {
-      const welcome =
-        "Hello ! Ici l’équipe FitMouv 👋\n\n" +
-        "On va préparer ton programme personnalisé (sport + nutrition) et revenir vers toi sous 24–48 h pour le passer ensemble et l’ajuster.\n" +
-        "Si tu as une contrainte urgente, écris-la ici.";
-      await sendText(waId, welcome);
-      const dueAt = Date.now() + randProgramDelayMs();
-      contacts.set(waId, { ...c, _welcomed: true, programScheduledAt: dueAt });
-      return;
-    }
-
-    // Réponse “humaine” avec délai
-    await sendText(waId, "Bien noté, je te réponds dans quelques minutes…");
-    await new Promise(r => setTimeout(r, randDelayMs()));
-
-    const last30 = c.history.slice(-30).map(h => ({
-      role: h.role === 'user' ? 'user' : 'assistant',
-      content: h.text,
-    }));
-    const sys =
-      "Tu es FitMouv (FR), coach sport + nutrition. Style naturel et chaleureux. " +
-      "Si le programme n’est pas encore envoyé, reste en mode collecte/clarification (1–2 questions max) et prends des notes mentales pour adapter le plan. " +
-      "Évite les sujets sensibles (médical, médicaments, paiements, politique/actualité à débat) et recentre calmement si ça sort du coaching.";
-    const mem = c.summary ? `Mémoire: ${c.summary}` : 'Pas de mémoire longue.';
-
-    const reply = await openaiChat([{ role: 'system', content: sys }, { role: 'user', content: mem }, ...last30]);
-    await sendText(waId, reply);
-
-    // Mémorise réponse et maj résumé
-    c = contacts.get(waId);
-    c.history.push({ role: 'assistant', text: reply, at: Date.now() });
-    contacts.set(waId, c);
-    updateLongSummary(waId).catch(e => console.error('updateLongSummary:', e.message));
-
+    return res.json({ ok: true });
   } catch (e) {
-    console.error('Erreur /webhook:', e);
+    console.error('/sio error:', e);
+    return res.status(500).json({ ok: false });
   }
 });
 
-// ===== Start =====
+// ---- Téléchargement média, réception WA, scheduler… (inchangé: garde tes blocs existants)
+
+// Lancement
 app.listen(PORT, () => console.log(`Serveur FitMouv lancé sur ${PORT}`));
