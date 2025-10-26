@@ -176,9 +176,9 @@ app.post('/admin/api/pause', adminAuth, (req,res) => {
   res.json({ ok:true, autoPaused: paused });
 });
 
-// --- [5] Page Admin (statique) ---
-app.get('/admin', adminAuth, (_req,res) => {
-  res.sendFile(path.join(__dirname, 'admin.html'));
+ // --- [5] Page Admin (statique) ---
+ // La page se charge sans auth ; les appels API restent protégés par adminAuth. app.get('/admin', (_req,res) => {
+   res.sendFile(path.join(__dirname, 'admin.html'));
 });
 
 // 5) STOCKAGE LÉGER + MÉMOIRE (RAM + /tmp)
