@@ -59,6 +59,128 @@ app.use((req, res, next) => {
   next();
 });
 
+// --- [1] ENV (ajoute près des autres const ENV déjà déclarées) ---
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'fitmouv_admin_please_change';
+
+// --- [2] Utils sécurité Admin (Basic Auth ultra simple) ---
+function adminAuth(req, res, next) {
+  try {
+    const h = req.headers.authorization || '';
+    if (!h.startsWith('Basic ')) return res.status(401).set('WWW-Authenticate','Basic').send('Auth required');
+
+    const base64 = h.slice('Basic '.length).trim();
+    const [user, pass] = Buffer.from(base64, 'base64').toString('utf8').split(':');
+    if (user !== 'admin' || pass !== ADMIN_SECRET) return res.status(403).send('Forbidden');
+    return next();
+  } catch {
+    return res.status(401).send('Auth required');
+  }
+}
+
+// --- [3] Petites helpers d’état pour le dashboard ---
+function isWindowOpen(waId) {
+  const c = contacts.get(waId);
+  if (!c || !c.lastUserAt) return false;
+  return (Date.now() - c.lastUserAt) <= (24 * 60 * 60 * 1000);
+}
+function lastMsgPreview(history = [], n = 1) {
+  const h = history.slice(-n);
+  return h.map(x => `[${x.role}] ${String(x.text || '').slice(0,120)}`).join('\n');
+}
+
+// --- [4] Endpoints Admin (JSON) ---
+app.get('/admin/api/contacts', adminAuth, (req, res) => {
+  const list = [];
+  for (const [waId, c] of contacts) {
+    list.push({
+      waId,
+      firstname: c?.sioProfile?.firstname || '',
+      lastname:  c?.sioProfile?.lastname  || '',
+      phone:     c?.sioProfile?.phone     || waId,
+      windowOpen: isWindowOpen(waId),
+      autoPaused: !!c?.autoPaused,
+      programSent: !!c?.programSent,
+      relanceStage: c?.relanceStage ?? 0,
+      lastRelanceAt: c?.lastRelanceAt || null,
+      lastUserAt: c?.lastUserAt || null,
+      lastPreview: lastMsgPreview(c?.history || [], 1)
+    });
+  }
+  res.json({ ok: true, contacts: list });
+});
+
+app.get('/admin/api/chat/:waId', adminAuth, (req, res) => {
+  const waId = req.params.waId;
+  const c = contacts.get(waId);
+  if (!c) return res.status(404).json({ ok:false, error:'not_found' });
+  res.json({
+    ok:true,
+    profile: c.sioProfile || {},
+    history: c.history || [],
+    windowOpen: isWindowOpen(waId),
+    autoPaused: !!c.autoPaused
+  });
+});
+
+app.post('/admin/api/send-text', adminAuth, async (req, res) => {
+  try {
+    const waId = String(req.body.waId || '').trim();
+    const text = String(req.body.text || '').trim();
+    if (!waId || !text) return res.status(400).json({ ok:false, error:'missing params' });
+
+    await sendText(waId, text);
+
+    // journalise côté serveur pour trace
+    const c = contacts.get(waId) || { history: [] };
+    c.history = c.history || [];
+    c.history.push({ role: 'assistant', text, at: Date.now(), by: 'admin' });
+    contacts.set(waId, c);
+
+    res.json({ ok:true });
+  } catch (e) {
+    console.error('admin send-text error:', e);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+app.post('/admin/api/send-template', adminAuth, async (req, res) => {
+  try {
+    const waId = String(req.body.waId || '').trim();
+    const template = String(req.body.template || '').trim();
+    const lang = String(req.body.lang || 'fr').trim();
+    const prenom = firstNameFor(waId) || '👋';
+
+    if (!waId || !template) return res.status(400).json({ ok:false, error:'missing params' });
+
+    const comps = [{ type:'body', parameters:[{ type:'text', text: prenom }] }];
+    await sendTemplate(waId, template, comps, lang);
+
+    const c = contacts.get(waId) || { history: [] };
+    c.history = c.history || [];
+    c.history.push({ role:'assistant', text:`[TEMPLATE ${template} ${lang}] ${prenom}`, at: Date.now(), by: 'admin' });
+    contacts.set(waId, c);
+
+    res.json({ ok:true });
+  } catch (e) {
+    console.error('admin send-template error:', e);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+app.post('/admin/api/pause', adminAuth, (req,res) => {
+  const waId = String(req.body.waId || '').trim();
+  const paused = !!req.body.paused;
+  const c = contacts.get(waId);
+  if (!c) return res.status(404).json({ ok:false, error:'not_found' });
+  contacts.set(waId, { ...c, autoPaused: paused });
+  res.json({ ok:true, autoPaused: paused });
+});
+
+// --- [5] Page Admin (statique) ---
+app.get('/admin', adminAuth, (_req,res) => {
+  res.sendFile(path.join(__dirname, 'admin.html'));
+});
+
 // 5) STOCKAGE LÉGER + MÉMOIRE (RAM + /tmp)
 const contacts = new Map(); // waId -> { sioProfile, history:[{role,text,at}], summary, programScheduledAt, programSent, _welcomed, lastUserAt, lastAssistantAt, relances:[{at,type,sent}], autoPaused }
 const DATA_DIR = path.join('/tmp');
