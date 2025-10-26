@@ -1,124 +1,163 @@
 <script>
 (() => {
-  const $contacts = document.getElementById('contacts');
-  const $refresh  = document.getElementById('refresh');
-  const $pause    = document.getElementById('pause');
-  const $sendBtn  = document.getElementById('sendBtn');
-  const $input    = document.getElementById('manualInput');
-  const $tplBtn   = document.getElementById('tplBtn');
-  const $tplSel   = document.getElementById('tplSelect');
-  const $langSel  = document.getElementById('langSelect');
-  const $history  = document.getElementById('history');
+  const $ = (sel) => document.querySelector(sel);
+  const listEl = document.getElementById('list');
+  const chatEl = document.getElementById('chat');
+  const pauseEl = document.getElementById('pause');
+  const tplSel = document.getElementById('tpl');
+  const langSel = document.getElementById('lang');
+  const btnSendTpl = document.getElementById('sendTpl');
+  const inputMsg = document.getElementById('msg');
+  const btnSend = document.getElementById('send');
+  const btnRefresh = document.getElementById('refresh');
 
-  // ——— Auth ———
-  let secret = localStorage.getItem('fitmouv_admin_secret') || '';
-  async function askSecret() {
-    while (!secret) {
-      secret = window.prompt('Admin secret ?') || '';
-    }
-    localStorage.setItem('fitmouv_admin_secret', secret);
-  }
-  function authHeaders() {
-    const token = btoa(`admin:${secret}`);
-    return { 'Authorization': `Basic ${token}`, 'Content-Type': 'application/json' };
-  }
-
-  // ——— UI state ———
+  let AUTH = '';
   let current = null;
+  let contacts = [];
 
-  function contactLine(c) {
-    const name = (c.firstName || c.lastName) ? `${c.firstName || ''} ${c.lastName || ''}`.trim() : c.waId;
-    const open = c.windowOpen ? '•' : '○';
-    const paused = c.autoPaused ? '⏸️' : '';
-    return `<div class="item" data-wa="${c.waId}">${open} ${name} ${paused}</div>`;
+  function uiError(msg) {
+    console.error(msg);
+    chatEl.innerHTML = `<div style="padding:16px;color:#b00;">${msg}</div>`;
   }
-
-  function setContacts(list) {
-    $contacts.innerHTML = list.map(contactLine).join('') || '<div class="item">Aucun contact</div>';
-    [...$contacts.querySelectorAll('.item')].forEach(el => {
-      el.addEventListener('click', async () => {
-        const waId = el.getAttribute('data-wa');
-        current = waId;
-        await loadHistory();
-        el.parentElement.querySelectorAll('.item').forEach(n => n.classList.remove('active'));
-        el.classList.add('active');
-      });
-    });
-  }
-
-  async function refreshContacts() {
-    const r = await fetch('/admin/contacts', { headers: authHeaders() });
-    if (!r.ok) {
-      if (r.status === 401 || r.status === 403) { localStorage.removeItem('fitmouv_admin_secret'); secret = ''; await init(); return; }
-      throw new Error(await r.text());
+  function renderList() {
+    listEl.innerHTML = '';
+    if (!contacts.length) {
+      listEl.innerHTML = `<div style="padding:8px;color:#888;">(Aucun contact encore)</div>`;
+      return;
     }
-    const data = await r.json();
-    setContacts(data.contacts || []);
+    for (const c of contacts) {
+      const div = document.createElement('div');
+      div.className = 'item';
+      div.textContent = `${c.firstname || ''} ${c.lastname || ''} · ${c.waId}`;
+      div.onclick = () => openChat(c.waId);
+      listEl.appendChild(div);
+    }
   }
-
-  async function loadHistory() {
-    if (!current) { $history.innerHTML = ''; return; }
-    const r = await fetch('/admin/history?waId=' + encodeURIComponent(current), { headers: authHeaders() });
-    const data = await r.json();
-    const items = (data.history || []).slice(-200).map(h => {
-      const who = h.role === 'user' ? 'client' : 'coach';
-      const t = new Date(h.at || Date.now()).toLocaleString();
-      return `<div class="bubble ${who}"><div class="time">${t}</div><div class="txt">${(h.text || '').replace(/</g,'&lt;')}</div></div>`;
+  function renderChat(h = []) {
+    chatEl.innerHTML = '';
+    if (!h.length) {
+      chatEl.innerHTML = `<div style="padding:16px;color:#777;">(Pas d'historique pour le moment)</div>`;
+      return;
+    }
+    for (const m of h) {
+      const d = document.createElement('div');
+      d.className = 'bubble ' + (m.role === 'user' ? 'user' : 'bot');
+      d.innerHTML = `<div class="msg">${(m.text || '').replace(/</g,'&lt;')}</div>
+                     <div class="meta">${new Date(m.at||Date.now()).toLocaleString()}</div>`;
+      chatEl.appendChild(d);
+    }
+    chatEl.scrollTop = chatEl.scrollHeight;
+  }
+  function authHeader() {
+    return AUTH ? { 'Authorization': AUTH } : {};
+  }
+  async function apiGet(path) {
+    const res = await fetch(path, { headers: { 'Accept':'application/json', ...authHeader() } });
+    if (res.status === 401 || res.status === 403) throw new Error('AUTH');
+    return res.json();
+  }
+  async function apiPost(path, body) {
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: { 'Content-Type':'application/json', 'Accept':'application/json', ...authHeader() },
+      body: JSON.stringify(body || {})
     });
-    $history.innerHTML = items.join('') || '<div class="muted">Aucun échange pour l’instant.</div>';
-    $history.scrollTop = $history.scrollHeight;
+    if (res.status === 401 || res.status === 403) throw new Error('AUTH');
+    return res.json();
   }
 
-  // ——— actions ———
+  async function ensureAuth() {
+    if (AUTH) return;
+    const secret = prompt('Admin secret ?') || '';
+    AUTH = 'Basic ' + btoa('admin:' + secret);
+  }
+
+  async function loadContacts() {
+    try {
+      await ensureAuth();
+      const data = await apiGet('/admin/api/contacts');
+      if (!data.ok) throw new Error('contacts not ok');
+      contacts = data.contacts || [];
+      renderList();
+    } catch (e) {
+      if (e.message === 'AUTH') {
+        AUTH = '';
+        uiError('⚠️ Accès refusé (401). Clique “Rafraîchir” pour réessayer et entre le bon secret.');
+        return;
+      }
+      uiError('Erreur chargement contacts : ' + e.message);
+    }
+  }
+
+  async function openChat(waId) {
+    current = waId;
+    try {
+      await ensureAuth();
+      const data = await apiGet('/admin/api/chat/' + encodeURIComponent(waId));
+      if (!data.ok) throw new Error('chat not ok');
+      renderChat(data.history || []);
+      pauseEl.checked = !!data.autoPaused;
+    } catch (e) {
+      if (e.message === 'AUTH') {
+        AUTH = '';
+        uiError('⚠️ Accès refusé (401). Clique “Rafraîchir” et réessaie.');
+        return;
+      }
+      uiError('Erreur ouverture chat : ' + e.message);
+    }
+  }
+
   async function sendText() {
-    if (!current) return alert('Choisis un contact');
-    const text = ($input.value || '').trim();
+    if (!current) return;
+    const text = (inputMsg.value || '').trim();
     if (!text) return;
-    const r = await fetch('/admin/send-text', {
-      method: 'POST',
-      headers: authHeaders(),
-      body: JSON.stringify({ waId: current, text })
-    });
-    if (r.ok) { $input.value=''; await loadHistory(); }
-    else alert('Erreur envoi texte');
+    try {
+      await ensureAuth();
+      const r = await apiPost('/admin/api/send-text', { waId: current, text });
+      if (!r.ok) throw new Error(r.error || 'send-text not ok');
+      inputMsg.value = '';
+      openChat(current);
+    } catch (e) {
+      if (e.message === 'AUTH') { AUTH = ''; uiError('⚠️ 401 sur envoi texte. Rafraîchis.'); return; }
+      uiError('Erreur envoi texte : ' + e.message);
+    }
   }
 
-  async function sendTemplate() {
-    if (!current) return alert('Choisis un contact');
-    const tpl  = $tplSel.value;
-    const lang = $langSel.value || 'fr';
-    const r = await fetch('/admin/send-template', {
-      method: 'POST',
-      headers: authHeaders(),
-      body: JSON.stringify({ waId: current, template: tpl, lang })
-    });
-    if (r.ok) { await loadHistory(); }
-    else alert('Erreur envoi template');
+  async function sendTpl() {
+    if (!current) return;
+    const template = tplSel.value;
+    const lang = langSel.value || 'fr';
+    try {
+      await ensureAuth();
+      const r = await apiPost('/admin/api/send-template', { waId: current, template, lang });
+      if (!r.ok) throw new Error(r.error || 'send-template not ok');
+      openChat(current);
+    } catch (e) {
+      if (e.message === 'AUTH') { AUTH = ''; uiError('⚠️ 401 sur envoi template. Rafraîchis.'); return; }
+      uiError('Erreur envoi template : ' + e.message);
+    }
   }
 
   async function togglePause() {
     if (!current) return;
-    const paused = $pause.checked;
-    await fetch('/admin/pause', {
-      method: 'POST',
-      headers: authHeaders(),
-      body: JSON.stringify({ waId: current, paused })
-    });
-    await refreshContacts();
+    try {
+      await ensureAuth();
+      const r = await apiPost('/admin/api/pause', { waId: current, paused: pauseEl.checked });
+      if (!r.ok) throw new Error(r.error || 'pause not ok');
+    } catch (e) {
+      if (e.message === 'AUTH') { AUTH = ''; uiError('⚠️ 401 sur pause. Rafraîchis.'); return; }
+      uiError('Erreur pause : ' + e.message);
+    }
   }
 
-  // ——— bind ———
-  $refresh.addEventListener('click', refreshContacts);
-  $sendBtn.addEventListener('click', sendText);
-  $tplBtn.addEventListener('click', sendTemplate);
-  $pause.addEventListener('change', togglePause);
-  $input.addEventListener('keydown', (e)=>{ if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); sendText(); }});
+  btnRefresh.onclick = loadContacts;
+  btnSend.onclick = sendText;
+  btnSendTpl.onclick = sendTpl;
+  pauseEl.onchange = togglePause;
 
-  // ——— init ———
-  async function init() {
-    if (!secret) await askSecret();
-    await refreshContacts();
-  }
-  init();
+  // 1er affichage
+  renderList();      // affiche au moins “Aucun contact…”
+  renderChat([]);    // zone vide propre
+  loadContacts();    // déclenche prompt + fetch
 })();
 </script>
