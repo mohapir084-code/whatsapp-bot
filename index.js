@@ -1,6 +1,6 @@
 // =======================
 // FitMouv WhatsApp Bot
-// Index.js — FULL (A/4)
+// index.js — FULL (merge OK)
 // =======================
 
 /* 1) BOOT EXPRESS */
@@ -111,8 +111,9 @@ function isWindowOpen(waId) {
   if (!c || !c.lastUserAt) return false;
   return within24h(c.lastUserAt);
 }
+
 // =======================
-// Index.js — FULL (B/4)
+// (B/4)
 // =======================
 
 /* 7) WHATSAPP HELPERS */
@@ -147,6 +148,16 @@ async function sendImage(to, link, caption = '') {
     image: { link, caption }
   });
 }
+// NEW: audio via URL
+async function sendAudioUrl(to, link) {
+  return waPost(`${PHONE_NUMBER_ID}/messages`, {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'audio',
+    audio: { link }
+  });
+}
+
 async function markAsRead(waId, msgId) {
   if (!msgId) return;
   try {
@@ -261,8 +272,9 @@ const EXOS_MEDIA = {
   squats:  "https://i.imgur.com/7q5E2iB.gif",
   plank:   "https://i.imgur.com/zV7rpxd.gif",
 };
+
 // =======================
-// Index.js — FULL (C/4)
+// (C/4)
 // =======================
 
 /* 12) ADMIN — Helpers + Auth */
@@ -281,7 +293,7 @@ function adminAuth(req, res, next) {
   } catch { return res.status(401).send('Auth required'); }
 }
 
-/* 13) ADMIN — API utilisée par admin.html (version unique, clean) */
+/* 13) ADMIN — API utilisée par admin.html */
 
 // Liste contacts (RAM uniquement)
 app.get('/admin/api/contacts', adminAuth, (req, res) => {
@@ -335,6 +347,27 @@ app.post('/admin/api/send-text', adminAuth, async (req, res) => {
     res.json({ ok:true });
   } catch (e) {
     console.error('admin send-text error:', e);
+    res.status(500).json({ ok:false, error:e.message });
+  }
+});
+
+// NEW: Envoi d’un audio (URL)
+app.post('/admin/api/send-audio-url', adminAuth, async (req, res) => {
+  try {
+    const waId = String(req.body.waId || '').trim();
+    const audioUrl = String(req.body.audioUrl || '').trim();
+    if (!waId || !audioUrl) return res.status(400).json({ ok:false, error:'missing params' });
+
+    await sendAudioUrl(waId, audioUrl);
+
+    const c = contacts.get(waId) || { history: [] };
+    c.history = c.history || [];
+    c.history.push({ role: 'assistant', text: `[AUDIO] ${audioUrl}`, at: Date.now(), by: 'admin' });
+    contacts.set(waId, c);
+
+    res.json({ ok:true });
+  } catch (e) {
+    console.error('admin send-audio-url error:', e);
     res.status(500).json({ ok:false, error:e.message });
   }
 });
@@ -429,8 +462,9 @@ setInterval(async () => {
     }
   } catch (e) { console.error('Relance scheduler error:', e.message); }
 }, 15 * ONE_MIN);
+
 // =======================
-// Index.js — FULL (D/4)
+// (D/4)
 // =======================
 
 /* 17) HEALTH */
