@@ -283,7 +283,9 @@ function adminAuth(req, res, next) {
 
 /* 13) ADMIN v1 (compat) */
 
-app.get('/admin/api/contacts', adminAuth, (req, res) => {
+app.get('/admin', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'admin.html'));
+});
   // 1) RAM
   const list = [];
   for (const [waId, c] of contacts) {
