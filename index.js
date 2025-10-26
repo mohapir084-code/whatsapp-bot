@@ -204,7 +204,93 @@ function writeClients(db) {
     console.error('writeClients error:', e);
   }
 }
+// === ADMIN ENDPOINTS (JSON) ===
+// NB: nécessite ADMIN_SECRET (env). La page admin.html enverra Authorization: Basic admin:<secret>
 
+app.get('/admin/contacts', adminAuth, (req, res) => {
+  // contacts en mémoire
+  const list = [];
+  for (const [waId, c] of contacts) {
+    list.push({
+      waId,
+      firstName: (c.sioProfile?.firstName || c.sioProfile?.firstname || '').trim(),
+      lastName:  (c.sioProfile?.lastName || c.sioProfile?.lastname || '').trim(),
+      lastUserAt: c.history?.filter(h => h.role === 'user').slice(-1)[0]?.at || null,
+      windowOpen: isWindowOpen(waId),
+      autoPaused: !!c.autoPaused,
+      relanceStage: c.relanceStage || 0,
+      lastRelanceAt: c.lastRelanceAt || null,
+    });
+  }
+  // si aucun contact mémoire, on tente de lister ceux du fichier clients.json basique
+  try {
+    const db = readClients();
+    for (const phone of Object.keys(db || {})) {
+      if (!list.find(x => x.waId === phone)) {
+        const lead = db[phone];
+        list.push({
+          waId: phone,
+          firstName: (lead.firstName || lead.prenom || '').trim(),
+          lastName:  (lead.lastName || lead.nom || '').trim(),
+          lastUserAt: null,
+          windowOpen: false,
+          autoPaused: false,
+          relanceStage: 0,
+          lastRelanceAt: null,
+        });
+      }
+    }
+  } catch {}
+  res.json({ ok: true, contacts: list.sort((a,b)=>(b.lastUserAt||0)-(a.lastUserAt||0)) });
+});
+
+app.get('/admin/history', adminAuth, (req, res) => {
+  const waId = (req.query.waId || '').trim();
+  const c = contacts.get(waId);
+  if (!c) return res.json({ ok: true, history: [] });
+  res.json({ ok: true, history: (c.history || []) });
+});
+
+app.post('/admin/send-text', adminAuth, async (req, res) => {
+  try {
+    const { waId, text } = req.body || {};
+    if (!waId || !text) return res.status(400).json({ ok: false, error: 'missing waId/text' });
+    await sendText(waId, text);
+    // journalise côté mémoire
+    const c = contacts.get(waId) || { history: [] };
+    c.history = c.history || [];
+    c.history.push({ role: 'assistant', text, at: Date.now() });
+    contacts.set(waId, c);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/admin/send-template', adminAuth, async (req, res) => {
+  try {
+    const { waId, template, lang = 'fr' } = req.body || {};
+    if (!waId || !template) return res.status(400).json({ ok: false, error: 'missing waId/template' });
+    // on injecte le prénom si {{1}} existe
+    const prenom = firstNameFor(waId) || '👋';
+    const components = [
+      { type: 'body', parameters: [{ type: 'text', text: prenom }] }
+    ];
+    const r = await sendTemplate(waId, template, components, lang);
+    res.json({ ok: true, meta: r });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/admin/pause', adminAuth, (req, res) => {
+  const { waId, paused } = req.body || {};
+  if (!waId) return res.status(400).json({ ok: false, error: 'missing waId' });
+  const c = contacts.get(waId) || {};
+  c.autoPaused = !!paused;
+  contacts.set(waId, c);
+  res.json({ ok: true, autoPaused: c.autoPaused });
+});
 // 6) UTILS
 function pick(v, fallback = '') {
   if (v === null || v === undefined) return fallback;
