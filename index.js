@@ -204,17 +204,52 @@ function writeClients(db) {
     console.error('writeClients error:', e);
   }
 }
-// === ADMIN ENDPOINTS (JSON) ===
-// NB: nécessite ADMIN_SECRET (env). La page admin.html enverra Authorization: Basic admin:<secret>
+// === ADMIN: endpoints + helpers + page statique (protégés par ADMIN_SECRET) ===
 
+// [A] Helpers d’état utilisés par l’admin
+function isWindowOpen(waId) {
+  const c = contacts.get(waId);
+  if (!c || !c.lastUserAt) return false;
+  // fenêtre ouverte si dernier msg user < 24h
+  return (Date.now() - c.lastUserAt) <= (24 * 60 * 60 * 1000);
+}
+function lastMsgPreview(history = [], n = 1) {
+  const h = history.slice(-n);
+  return h.map(x => `[${x.role}] ${String(x.text || '').slice(0, 120)}`).join('\n');
+}
+function firstNameFor(waId) {
+  const c = contacts.get(waId) || {};
+  const p = c.sioProfile || {};
+  return (p.firstName || p.firstname || p.FirstName || '').trim();
+}
+
+// [B] Mini auth Basic: utilisateur = "admin", mot de passe = ADMIN_SECRET
+const ADMIN_SECRET = process.env.ADMIN_SECRET || 'fitmouv_admin_please_change';
+function adminAuth(req, res, next) {
+  try {
+    const h = req.headers.authorization || '';
+    if (!h.startsWith('Basic ')) {
+      return res.status(401).set('WWW-Authenticate', 'Basic').send('Auth required');
+    }
+    const base64 = h.slice('Basic '.length).trim();
+    const [user, pass] = Buffer.from(base64, 'base64').toString('utf8').split(':');
+    if (user !== 'admin' || pass !== ADMIN_SECRET) {
+      return res.status(403).send('Forbidden');
+    }
+    return next();
+  } catch {
+    return res.status(401).send('Auth required');
+  }
+}
+
+// [C] Endpoints JSON v1 (compat)
 app.get('/admin/contacts', adminAuth, (req, res) => {
-  // contacts en mémoire
   const list = [];
   for (const [waId, c] of contacts) {
     list.push({
       waId,
       firstName: (c.sioProfile?.firstName || c.sioProfile?.firstname || '').trim(),
-      lastName:  (c.sioProfile?.lastName || c.sioProfile?.lastname || '').trim(),
+      lastName:  (c.sioProfile?.lastName  || c.sioProfile?.lastname  || '').trim(),
       lastUserAt: c.history?.filter(h => h.role === 'user').slice(-1)[0]?.at || null,
       windowOpen: isWindowOpen(waId),
       autoPaused: !!c.autoPaused,
@@ -222,7 +257,7 @@ app.get('/admin/contacts', adminAuth, (req, res) => {
       lastRelanceAt: c.lastRelanceAt || null,
     });
   }
-  // si aucun contact mémoire, on tente de lister ceux du fichier clients.json basique
+  // complète avec /tmp/clients.json si vide
   try {
     const db = readClients();
     for (const phone of Object.keys(db || {})) {
@@ -231,7 +266,7 @@ app.get('/admin/contacts', adminAuth, (req, res) => {
         list.push({
           waId: phone,
           firstName: (lead.firstName || lead.prenom || '').trim(),
-          lastName:  (lead.lastName || lead.nom || '').trim(),
+          lastName:  (lead.lastName  || lead.nom    || '').trim(),
           lastUserAt: null,
           windowOpen: false,
           autoPaused: false,
@@ -241,7 +276,7 @@ app.get('/admin/contacts', adminAuth, (req, res) => {
       }
     }
   } catch {}
-  res.json({ ok: true, contacts: list.sort((a,b)=>(b.lastUserAt||0)-(a.lastUserAt||0)) });
+  res.json({ ok: true, contacts: list.sort((a, b) => (b.lastUserAt || 0) - (a.lastUserAt || 0)) });
 });
 
 app.get('/admin/history', adminAuth, (req, res) => {
@@ -256,10 +291,9 @@ app.post('/admin/send-text', adminAuth, async (req, res) => {
     const { waId, text } = req.body || {};
     if (!waId || !text) return res.status(400).json({ ok: false, error: 'missing waId/text' });
     await sendText(waId, text);
-    // journalise côté mémoire
     const c = contacts.get(waId) || { history: [] };
     c.history = c.history || [];
-    c.history.push({ role: 'assistant', text, at: Date.now() });
+    c.history.push({ role: 'assistant', text, at: Date.now(), by: 'admin' });
     contacts.set(waId, c);
     res.json({ ok: true });
   } catch (e) {
@@ -271,12 +305,9 @@ app.post('/admin/send-template', adminAuth, async (req, res) => {
   try {
     const { waId, template, lang = 'fr' } = req.body || {};
     if (!waId || !template) return res.status(400).json({ ok: false, error: 'missing waId/template' });
-    // on injecte le prénom si {{1}} existe
     const prenom = firstNameFor(waId) || '👋';
-    const components = [
-      { type: 'body', parameters: [{ type: 'text', text: prenom }] }
-    ];
-    const r = await sendTemplate(waId, template, components, lang);
+    const comps = [{ type: 'body', parameters: [{ type: 'text', text: prenom }] }];
+    const r = await sendTemplate(waId, template, comps, lang);
     res.json({ ok: true, meta: r });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -290,6 +321,91 @@ app.post('/admin/pause', adminAuth, (req, res) => {
   c.autoPaused = !!paused;
   contacts.set(waId, c);
   res.json({ ok: true, autoPaused: c.autoPaused });
+});
+
+// [D] Endpoints JSON v2 (utilisés par la page admin.html)
+app.get('/admin/api/contacts', adminAuth, (req, res) => {
+  const list = [];
+  for (const [waId, c] of contacts) {
+    list.push({
+      waId,
+      firstname: c?.sioProfile?.firstname || c?.sioProfile?.firstName || '',
+      lastname:  c?.sioProfile?.lastname  || c?.sioProfile?.lastName  || '',
+      phone:     c?.sioProfile?.phone     || waId,
+      windowOpen: isWindowOpen(waId),
+      autoPaused: !!c?.autoPaused,
+      programSent: !!c?.programSent,
+      relanceStage: c?.relanceStage ?? 0,
+      lastRelanceAt: c?.lastRelanceAt || null,
+      lastUserAt: c?.lastUserAt || null,
+      lastPreview: lastMsgPreview(c?.history || [], 1),
+    });
+  }
+  res.json({ ok: true, contacts: list });
+});
+
+app.get('/admin/api/chat/:waId', adminAuth, (req, res) => {
+  const waId = req.params.waId;
+  const c = contacts.get(waId);
+  if (!c) return res.status(404).json({ ok: false, error: 'not_found' });
+  res.json({
+    ok: true,
+    profile: c.sioProfile || {},
+    history: c.history || [],
+    windowOpen: isWindowOpen(waId),
+    autoPaused: !!c.autoPaused,
+  });
+});
+
+app.post('/admin/api/send-text', adminAuth, async (req, res) => {
+  try {
+    const waId = String(req.body.waId || '').trim();
+    const text = String(req.body.text || '').trim();
+    if (!waId || !text) return res.status(400).json({ ok: false, error: 'missing params' });
+    await sendText(waId, text);
+    const c = contacts.get(waId) || { history: [] };
+    c.history = c.history || [];
+    c.history.push({ role: 'assistant', text, at: Date.now(), by: 'admin' });
+    contacts.set(waId, c);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('admin send-text error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/admin/api/send-template', adminAuth, async (req, res) => {
+  try {
+    const waId = String(req.body.waId || '').trim();
+    const template = String(req.body.template || '').trim();
+    const lang = String(req.body.lang || 'fr').trim();
+    const prenom = firstNameFor(waId) || '👋';
+    if (!waId || !template) return res.status(400).json({ ok: false, error: 'missing params' });
+    const comps = [{ type: 'body', parameters: [{ type: 'text', text: prenom }] }];
+    await sendTemplate(waId, template, comps, lang);
+    const c = contacts.get(waId) || { history: [] };
+    c.history = c.history || [];
+    c.history.push({ role: 'assistant', text: `[TEMPLATE ${template} ${lang}] ${prenom}`, at: Date.now(), by: 'admin' });
+    contacts.set(waId, c);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('admin send-template error:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/admin/api/pause', adminAuth, (req, res) => {
+  const waId = String(req.body.waId || '').trim();
+  const paused = !!req.body.paused;
+  const c = contacts.get(waId);
+  if (!c) return res.status(404).json({ ok: false, error: 'not_found' });
+  contacts.set(waId, { ...c, autoPaused: paused });
+  res.json({ ok: true, autoPaused: paused });
+});
+
+// [E] Page statique
+app.get('/admin', adminAuth, (_req, res) => {
+  res.sendFile(path.join(__dirname, 'admin.html'));
 });
 // 6) UTILS
 function pick(v, fallback = '') {
