@@ -108,6 +108,57 @@ function toE164FR(any) {
   if (/^\d{10,15}$/.test(s)) return '+' + s;
   return s;
 }
+// ===== Fenêtre ouverte & silence nocturne =====
+const ONE_MIN  = 60 * 1000;
+const ONE_HOUR = 60 * ONE_MIN;
+const ONE_DAY  = 24 * ONE_HOUR;
+
+// WhatsApp “fenêtre ouverte” = 24h après le DERNIER message du client
+function isWindowOpen(contact) {
+  if (!contact?.lastUserAt) return false;
+  return Date.now() < (contact.lastUserAt + 24 * ONE_HOUR);
+}
+
+// Heure locale Paris pour couper la nuit
+function parisHour() {
+  const hStr = new Date().toLocaleString('fr-FR', {
+    timeZone: 'Europe/Paris',
+    hour: '2-digit',
+    hour12: false
+  });
+  return Number(hStr);
+}
+// Silence entre 22:00 et 06:59
+function isQuietHoursParis() {
+  const h = parisHour();
+  return (h >= 22 || h < 7);
+}
+
+// ===== Journalisation / état persistant clients =====
+function getClientState(waId) {
+  const db = readClients();
+  const c = db[waId] || {};
+  // champs par défaut
+  return {
+    // timestamps
+    lastUserAt: c.lastUserAt || null,   // dernier msg reçu du client
+    lastBotAt:  c.lastBotAt  || null,   // dernier msg envoyé (IA ou template)
+    // relances
+    relanceStage: c.relanceStage || 0,  // 0: aucune, 1: J+1, 2: J+3, 3: J+5
+    lastRelanceAt: c.lastRelanceAt || null,
+    manualRequired: !!c.manualRequired, // bascule à true après 7j fermés
+    // profil + résumé existants
+    ...c
+  };
+}
+function setClientState(waId, patch) {
+  const db = readClients();
+  const old = db[waId] || {};
+  const upd = { ...old, ...patch };
+  db[waId] = upd;
+  writeClients(db);
+  return upd;
+}
 
 // Helper pour récupérer le prénom à partir du contact
 function firstNameFor(waId) {
@@ -573,7 +624,24 @@ app.post('/webhook', async (req, res) => {
 
     let c = contacts.get(waId) || { history: [], programSent: false, programScheduledAt: null, sioProfile: null, summary: '', relances: [], autoPaused: false };
     contacts.set(waId, c);
+    
+// --- Mise à jour état (fenêtre ouverte) ---
+let state = getClientState(waId);
+state = setClientState(waId, {
+  lastUserAt: Date.now(),
+  // si le client répond, on remet la machine à zéro côté relances auto
+  relanceStage: 0,
+  lastRelanceAt: null,
+  manualRequired: false
+});
 
+// L'IA peut répondre uniquement HORS silence nocturne
+if (isQuietHoursParis()) {
+  // on log mais on n'envoie rien pendant la plage 22h–7h
+  console.log(`[QUIET] Message client reçu ${waId} à ${new Date().toISOString()} — réponse IA différée.`);
+  return; // on arrête ici (pas de reply instantané la nuit)
+}
+    
     await markAsRead(waId, msgId);
 
     let userText = '';
@@ -642,6 +710,100 @@ app.post('/webhook', async (req, res) => {
     console.error('Erreur /webhook:', e);
   }
 });
+
+// =======================
+// BLOC 3 — Relances auto
+// =======================
+
+// Paramètres de cadence relances (fenêtre FERMÉE uniquement)
+const RELANCE_COOLDOWNS_H = [0, 24, 48, 72];  // R0 immédiate, puis +24h, +48h, +72h
+const RELANCE_MAX_SILENT_DAYS = 7;            // Au-delà : on arrête l’auto, passage manuel
+const RELANCE_TEMPLATES = [
+  'fitmouv_check_contact',  // R0
+  'relance_fitmouv',        // R1
+  'reprise_fitmouv',        // R2
+  'fitmouv_relance_finale', // R3
+];
+
+// Vérifie si la fenêtre 24h est ouverte (basé sur le dernier message client)
+function isWindowOpen(waId) {
+  const st = getClientState(waId);
+  if (!st?.lastUserAt) return false;
+  const ageMs = Date.now() - st.lastUserAt;
+  return ageMs <= ONE_DAY; // fenêtre 24h
+}
+
+// Nb de jours consécutifs sans réponse client
+function silentDays(waId) {
+  const st = getClientState(waId);
+  if (!st?.lastUserAt) return Infinity;
+  const ms = Date.now() - st.lastUserAt;
+  return Math.floor(ms / ONE_DAY);
+}
+
+// Récup prénom (déjà défini plus haut, on le réutilise)
+function firstNameForOrEmpty(waId) {
+  try { return (firstNameFor(waId) || '').trim(); } catch { return ''; }
+}
+
+// Tâche périodique : toutes les 15 min
+setInterval(async () => {
+  try {
+    // Silence nocturne global
+    if (isQuietHoursParis()) return;
+
+    for (const [waId, _c] of contacts) {
+      let st = getClientState(waId) || {};
+      if (st.manualRequired) continue;  // basculé en suivi manuel
+      if (st.autoPaused) continue;      // pause admin
+
+      // si fenêtre OUVERTE => pas de template (l’IA garde la fenêtre)
+      if (isWindowOpen(waId)) continue;
+
+      // si silence > 7 jours => stop auto, passer en manuel
+      if (silentDays(waId) >= RELANCE_MAX_SILENT_DAYS) {
+        st = setClientState(waId, { manualRequired: true });
+        continue;
+      }
+
+      // relanceStage ∈ [0..3], null/undefined => 0
+      const stage = Number.isInteger(st.relanceStage) ? st.relanceStage : 0;
+      if (stage >= RELANCE_TEMPLATES.length) continue; // plus rien à envoyer
+
+      // respect du cooldown entre relances
+      const last = st.lastRelanceAt || 0;
+      const neededMs = RELANCE_COOLDOWNS_H[stage] * ONE_HOUR;
+      const elapsed = Date.now() - last;
+      if (elapsed < neededMs) continue;
+
+      // construit les composants ({{1}} = prénom)
+      const prenom = firstNameForOrEmpty(waId) || '👋';
+      const components = [
+        { type: 'body', parameters: [{ type: 'text', text: prenom }] }
+      ];
+
+      // Sécurité horaires + fenêtre fermée
+      if (isQuietHoursParis()) continue;
+      if (isWindowOpen(waId)) continue;
+
+      // Envoi du template de cette étape
+      const tpl = RELANCE_TEMPLATES[stage];
+      try {
+        await sendTemplate(waId, tpl, components);
+        setClientState(waId, {
+          relanceStage: stage + 1,
+          lastRelanceAt: Date.now()
+        });
+        console.log(`Relance envoyée à ${waId} — étape ${stage} (${tpl})`);
+      } catch (e) {
+        console.error(`Relance échec ${waId} étape ${stage} (${tpl}):`, e.message);
+        // on n'incrémente pas l’étape en cas d’échec
+      }
+    }
+  } catch (e) {
+    console.error('Relance scheduler error:', e.message);
+  }
+}, 15 * ONE_MIN);
 
 // 13) START
 app.listen(PORT, () => console.log(`🚀 Serveur FitMouv lancé sur ${PORT}`));
