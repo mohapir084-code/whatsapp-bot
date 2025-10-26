@@ -281,116 +281,90 @@ function adminAuth(req, res, next) {
   } catch { return res.status(401).send('Auth required'); }
 }
 
-/* 13) ADMIN v1 (compat) */
+/* 13) ADMIN — API utilisée par admin.html (version unique, clean) */
 
-app.get('/admin', (_req, res) => {
-  res.sendFile(path.join(__dirname, 'admin.html'));
-});
-  // 1) RAM
-  const list = [];
-  for (const [waId, c] of contacts) {
-    list.push({
-      waId,
-      firstname: c?.sioProfile?.firstName || c?.sioProfile?.firstname || '',
-      lastname:  c?.sioProfile?.lastName  || c?.sioProfile?.lastname  || '',
-      phone:     c?.sioProfile?.phone     || waId,
-      windowOpen: isWindowOpen(waId),
-      autoPaused: !!c?.autoPaused,
-      programSent: !!c?.programSent,
-      relanceStage: c?.relanceStage ?? 0,
-      lastRelanceAt: c?.lastRelanceAt || null,
-      lastUserAt: c?.lastUserAt || null,
-      lastPreview: lastMsgPreview(c?.history || [], 1)
-    });
-  }
-
-  // 2) + FICHIER /tmp/clients.json
-  try {
-    const db = readClients() || {};
-    for (const phone of Object.keys(db)) {
-      if (!list.find(x => x.waId === phone)) {
-        const lead = db[phone] || {};
-        list.push({
-          waId: phone,
-          firstname: (lead.firstName || lead.prenom || '').trim(),
-          lastname:  (lead.lastName  || lead.nom    || '').trim(),
-          phone,
-          windowOpen: false,
-          autoPaused: false,
-          programSent: false,
-          relanceStage: 0,
-          lastRelanceAt: null,
-          lastUserAt: null,
-          lastPreview: ''
-        });
-      }
-    }
-  } catch (e) {
-    console.error('merge clients.json -> admin/api/contacts:', e.message);
-  }
-
-  // 3) tri anti-null
-  res.json({
-    ok: true,
-    contacts: list.sort((a,b)=>(b.lastUserAt||0)-(a.lastUserAt||0))
-  });
-});
-
-/* 14) ADMIN v2 (utilisée par admin.html) */
+// Liste contacts (RAM uniquement)
 app.get('/admin/api/contacts', adminAuth, (req, res) => {
   const list = [];
   for (const [waId, c] of contacts) {
     list.push({
       waId,
-      firstname: c?.sioProfile?.firstname || c?.sioProfile?.firstName || '',
-      lastname:  c?.sioProfile?.lastname  || c?.sioProfile?.lastName  || '',
-      phone:     c?.sioProfile?.phone     || waId,
+      firstname:  c?.sioProfile?.firstname || c?.sioProfile?.firstName || '',
+      lastname:   c?.sioProfile?.lastname  || c?.sioProfile?.lastName  || '',
+      phone:      c?.sioProfile?.phone     || waId,
       windowOpen: isWindowOpen(waId),
       autoPaused: !!c?.autoPaused,
       programSent: !!c?.programSent,
       relanceStage: c?.relanceStage ?? 0,
       lastRelanceAt: c?.lastRelanceAt || null,
       lastUserAt: c?.lastUserAt || null,
-      lastPreview: lastMsgPreview(c?.history || [], 1)
+      lastPreview: lastMsgPreview(c?.history || [], 1),
     });
   }
   res.json({ ok: true, contacts: list });
 });
+
+// Historique d’un contact
 app.get('/admin/api/chat/:waId', adminAuth, (req, res) => {
-  const waId = req.params.waId;
+  const waId = String(req.params.waId || '').trim();
   const c = contacts.get(waId);
   if (!c) return res.status(404).json({ ok:false, error:'not_found' });
-  res.json({ ok:true, profile: c.sioProfile || {}, history: c.history || [], windowOpen: isWindowOpen(waId), autoPaused: !!c.autoPaused });
+  res.json({
+    ok:true,
+    profile: c.sioProfile || {},
+    history: c.history || [],
+    windowOpen: isWindowOpen(waId),
+    autoPaused: !!c.autoPaused,
+  });
 });
+
+// Envoi d’un texte manuel
 app.post('/admin/api/send-text', adminAuth, async (req, res) => {
   try {
     const waId = String(req.body.waId || '').trim();
-    const text  = String(req.body.text  || '').trim();
+    const text = String(req.body.text || '').trim();
     if (!waId || !text) return res.status(400).json({ ok:false, error:'missing params' });
+
     await sendText(waId, text);
+
     const c = contacts.get(waId) || { history: [] };
     c.history = c.history || [];
     c.history.push({ role: 'assistant', text, at: Date.now(), by: 'admin' });
     contacts.set(waId, c);
+
     res.json({ ok:true });
-  } catch (e) { console.error('admin send-text error:', e); res.status(500).json({ ok:false, error:e.message }); }
+  } catch (e) {
+    console.error('admin send-text error:', e);
+    res.status(500).json({ ok:false, error:e.message });
+  }
 });
+
+// Envoi d’un template manuel
 app.post('/admin/api/send-template', adminAuth, async (req, res) => {
   try {
     const waId     = String(req.body.waId || '').trim();
     const template = String(req.body.template || '').trim();
     const lang     = String(req.body.lang || 'fr').trim();
-    const prenom   = firstNameFor(waId) || '👋';
     if (!waId || !template) return res.status(400).json({ ok:false, error:'missing params' });
+
+    const prenom = firstNameFor(waId) || '👋';
     const comps = [{ type:'body', parameters:[{ type:'text', text: prenom }] }];
+
     await sendTemplate(waId, template, comps, lang);
+
     const c = contacts.get(waId) || { history: [] };
     c.history = c.history || [];
     c.history.push({ role:'assistant', text:`[TEMPLATE ${template} ${lang}] ${prenom}`, at: Date.now(), by:'admin' });
     contacts.set(waId, c);
+
     res.json({ ok:true });
-  } catch (e) { console.error('admin send-template error:', e); res.status(500).json({ ok:false, error:e.message }); }
+  } catch (e) {
+    console.error('admin send-template error:', e);
+    res.status(500).json({ ok:false, error:e.message });
+  }
 });
+
+// Pause/reprise auto-relances
 app.post('/admin/api/pause', adminAuth, (req,res) => {
   const waId = String(req.body.waId || '').trim();
   const paused = !!req.body.paused;
@@ -400,8 +374,8 @@ app.post('/admin/api/pause', adminAuth, (req,res) => {
   res.json({ ok:true, autoPaused: paused });
 });
 
-// Page statique
-app.get('/admin', adminAuth, (_req,res) => {
+// Page Admin (statique) — SANS auth ici (l’auth est sur /admin/api/*)
+app.get('/admin', (_req,res) => {
   res.sendFile(path.join(__dirname, 'admin.html'));
 });
 
