@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <title>FitMouv Admin</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; display: grid; grid-template-columns: 340px 1fr; height: 100vh; }
+    header { grid-column: 1 / -1; padding: 12px 16px; background: #0f172a; color: #fff; font-weight: 600; }
+    aside { border-right: 1px solid #e5e7eb; overflow: auto; }
+    main { display: grid; grid-template-rows: auto 1fr auto; height: calc(100vh - 48px); }
+    .toolbar { padding: 10px 12px; border-bottom: 1px solid #e5e7eb; display: flex; gap: 8px; align-items: center; }
+    .list { padding: 8px; }
+    .item { border:1px solid #e5e7eb; border-radius:10px; padding:10px; margin:8px 6px; cursor:pointer; }
+    .item small { color:#6b7280; display:block; }
+    .tag { display:inline-block; font-size:12px; padding:2px 8px; border-radius:999px; background:#eef2ff; color:#3730a3; margin-left:6px; }
+    .chat { padding: 12px; overflow:auto; background:#f8fafc; }
+    .bubble { max-width: 70%; margin: 6px 0; padding: 10px 12px; border-radius: 12px; white-space: pre-wrap; }
+    .user { background:#fff; border:1px solid #e2e8f0; }
+    .assistant { background:#dcfce7; border:1px solid #bbf7d0; margin-left:auto; }
+    form.send { display:flex; gap:8px; padding:10px; border-top:1px solid #e5e7eb; }
+    input, select, button, textarea { font: inherit; }
+    textarea { flex:1; padding:10px; border:1px solid #e5e7eb; border-radius:10px; min-height:46px; }
+    button { padding:10px 14px; border:0; border-radius:10px; background:#0ea5e9; color:#fff; cursor:pointer; }
+    .muted { color:#6b7280; font-size:12px; margin-left:8px; }
+  </style>
+</head>
+<body>
+  <header>FitMouv — Console Admin</header>
+
+  <aside>
+    <div class="toolbar">
+      <button id="refresh">Rafraîchir</button>
+      <span class="muted" id="count"></span>
+    </div>
+    <div class="list" id="list"></div>
+  </aside>
+
+  <main>
+    <div class="toolbar">
+      <div id="who">Sélectionne un contact…</div>
+      <div style="margin-left:auto; display:flex; gap:8px; align-items:center;">
+        <label><input type="checkbox" id="pause"> Pauser relances</label>
+        <select id="tpl">
+          <option value="fitmouv_welcome">fitmouv_welcome</option>
+          <option value="programme_pret_fitmouv">programme_pret_fitmouv</option>
+          <option value="relance_fitmouv">relance_fitmouv</option>
+          <option value="reprise_fitmouv">reprise_fitmouv</option>
+          <option value="fitmouv_relance_finale">fitmouv_relance_finale</option>
+          <option value="fitmouv_check_contact">fitmouv_check_contact</option>
+        </select>
+        <select id="lang">
+          <option value="fr">fr</option>
+          <option value="fr_FR">fr_FR</option>
+          <option value="french">french</option>
+        </select>
+        <button id="sendTpl">Envoyer template</button>
+      </div>
+    </div>
+
+    <div class="chat" id="chat"></div>
+
+    <form class="send" id="sendForm">
+      <textarea id="text" placeholder="Écris ton message manuel…"></textarea>
+      <button type="submit">Envoyer</button>
+    </form>
+  </main>
+
+<script>
+const auth = 'Basic ' + btoa('admin:' + prompt('Admin secret ?'));
+let current = null;
+
+function fmt(t){ if(!t) return ''; const d=new Date(t); return d.toLocaleString(); }
+
+async function api(path, opts={}) {
+  const res = await fetch(path, { headers: { Authorization: auth, 'Content-Type':'application/json' }, ...opts });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function loadContacts() {
+  const data = await api('/admin/api/contacts');
+  const list = document.getElementById('list');
+  list.innerHTML = '';
+  document.getElementById('count').textContent = (data.contacts||[]).length + ' contacts';
+  (data.contacts||[]).forEach(c => {
+    const div = document.createElement('div');
+    div.className = 'item';
+    div.onclick = () => openChat(c.waId);
+    div.innerHTML = `
+      <strong>${c.firstname || 'Sans nom'} ${c.lastname||''}</strong>
+      ${c.windowOpen ? '<span class="tag">fenêtre ouverte</span>' : ''}
+      ${c.autoPaused ? '<span class="tag">relances en pause</span>' : ''}
+      <small>${c.phone}</small>
+      <small>Dernier msg: ${c.lastPreview || '—'}</small>
+    `;
+    list.appendChild(div);
+  });
+}
+
+async function openChat(waId) {
+  current = waId;
+  const data = await api('/admin/api/chat/' + waId);
+  document.getElementById('who').textContent =
+    (data.profile?.firstname||'Sans nom') + ' ' + (data.profile?.lastname||'') + ' • ' + (data.profile?.phone||waId);
+  document.getElementById('pause').checked = !!data.autoPaused;
+
+  const chat = document.getElementById('chat');
+  chat.innerHTML = '';
+  (data.history||[]).forEach(m => {
+    const b = document.createElement('div');
+    b.className = 'bubble ' + (m.role === 'user' ? 'user' : 'assistant');
+    b.innerHTML = m.text.replaceAll('*',''); // pas de gras
+    chat.appendChild(b);
+  });
+  chat.scrollTop = chat.scrollHeight;
+}
+
+document.getElementById('refresh').onclick = loadContacts;
+
+document.getElementById('pause').onchange = async (e) => {
+  if (!current) return;
+  await api('/admin/api/pause', { method:'POST', body: JSON.stringify({ waId: current, paused: e.target.checked }) });
+};
+
+document.getElementById('sendTpl').onclick = async () => {
+  if (!current) return;
+  const template = document.getElementById('tpl').value;
+  const lang = document.getElementById('lang').value;
+  await api('/admin/api/send-template', { method:'POST', body: JSON.stringify({ waId: current, template, lang }) });
+  await openChat(current);
+};
+
+document.getElementById('sendForm').onsubmit = async (e) => {
+  e.preventDefault();
+  if (!current) return;
+  const text = document.getElementById('text').value.trim();
+  if (!text) return;
+  document.getElementById('text').value = '';
+  await api('/admin/api/send-text', { method:'POST', body: JSON.stringify({ waId: current, text }) });
+  await openChat(current);
+};
+
+loadContacts().catch(err => alert(err.message));
+</script>
+</body>
+</html>
