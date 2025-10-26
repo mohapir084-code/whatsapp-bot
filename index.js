@@ -282,71 +282,56 @@ function adminAuth(req, res, next) {
 }
 
 /* 13) ADMIN v1 (compat) */
-app.get('/admin/contacts', adminAuth, (req, res) => {
+
+app.get('/admin/api/contacts', adminAuth, (req, res) => {
+  // 1) RAM
   const list = [];
   for (const [waId, c] of contacts) {
     list.push({
       waId,
-      firstName: (c.sioProfile?.firstName || c.sioProfile?.firstname || '').trim(),
-      lastName:  (c.sioProfile?.lastName  || c.sioProfile?.lastname  || '').trim(),
-      lastUserAt: c.history?.filter(h => h.role === 'user').slice(-1)[0]?.at || null,
+      firstname: c?.sioProfile?.firstName || c?.sioProfile?.firstname || '',
+      lastname:  c?.sioProfile?.lastName  || c?.sioProfile?.lastname  || '',
+      phone:     c?.sioProfile?.phone     || waId,
       windowOpen: isWindowOpen(waId),
-      autoPaused: !!c.autoPaused,
-      relanceStage: c.relanceStage || 0,
-      lastRelanceAt: c.lastRelanceAt || null,
+      autoPaused: !!c?.autoPaused,
+      programSent: !!c?.programSent,
+      relanceStage: c?.relanceStage ?? 0,
+      lastRelanceAt: c?.lastRelanceAt || null,
+      lastUserAt: c?.lastUserAt || null,
+      lastPreview: lastMsgPreview(c?.history || [], 1)
     });
   }
+
+  // 2) + FICHIER /tmp/clients.json
   try {
-    const db = readClients();
-    for (const phone of Object.keys(db || {})) {
+    const db = readClients() || {};
+    for (const phone of Object.keys(db)) {
       if (!list.find(x => x.waId === phone)) {
-        const lead = db[phone];
+        const lead = db[phone] || {};
         list.push({
           waId: phone,
-          firstName: (lead.firstName || lead.prenom || '').trim(),
-          lastName:  (lead.lastName  || lead.nom    || '').trim(),
-          lastUserAt: null, windowOpen: false, autoPaused: false, relanceStage: 0, lastRelanceAt: null
+          firstname: (lead.firstName || lead.prenom || '').trim(),
+          lastname:  (lead.lastName  || lead.nom    || '').trim(),
+          phone,
+          windowOpen: false,
+          autoPaused: false,
+          programSent: false,
+          relanceStage: 0,
+          lastRelanceAt: null,
+          lastUserAt: null,
+          lastPreview: ''
         });
       }
     }
-  } catch {}
-  res.json({ ok: true, contacts: list.sort((a,b)=>(b.lastUserAt||0)-(a.lastUserAt||0)) });
-});
-app.get('/admin/history', adminAuth, (req, res) => {
-  const waId = (req.query.waId || '').trim();
-  const c = contacts.get(waId);
-  if (!c) return res.json({ ok: true, history: [] });
-  res.json({ ok: true, history: (c.history || []) });
-});
-app.post('/admin/send-text', adminAuth, async (req, res) => {
-  try {
-    const { waId, text } = req.body || {};
-    if (!waId || !text) return res.status(400).json({ ok: false, error: 'missing waId/text' });
-    await sendText(waId, text);
-    const c = contacts.get(waId) || { history: [] };
-    c.history = c.history || [];
-    c.history.push({ role: 'assistant', text, at: Date.now(), by: 'admin' });
-    contacts.set(waId, c);
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-});
-app.post('/admin/send-template', adminAuth, async (req, res) => {
-  try {
-    const { waId, template, lang = 'fr' } = req.body || {};
-    if (!waId || !template) return res.status(400).json({ ok: false, error: 'missing waId/template' });
-    const prenom = firstNameFor(waId) || '👋';
-    const comps = [{ type:'body', parameters:[{ type:'text', text: prenom }] }];
-    const r = await sendTemplate(waId, template, comps, lang);
-    res.json({ ok: true, meta: r });
-  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
-});
-app.post('/admin/pause', adminAuth, (req, res) => {
-  const { waId, paused } = req.body || {};
-  if (!waId) return res.status(400).json({ ok: false, error: 'missing waId' });
-  const c = contacts.get(waId) || {};
-  c.autoPaused = !!paused;
-  contacts.set(waId, c);
-  res.json({ ok: true, autoPaused: c.autoPaused });
+  } catch (e) {
+    console.error('merge clients.json -> admin/api/contacts:', e.message);
+  }
+
+  // 3) tri anti-null
+  res.json({
+    ok: true,
+    contacts: list.sort((a,b)=>(b.lastUserAt||0)-(a.lastUserAt||0))
+  });
 });
 
 /* 14) ADMIN v2 (utilisée par admin.html) */
