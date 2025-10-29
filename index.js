@@ -1,53 +1,153 @@
 // index.js
-const express = require("express");
-const axios = require("axios");
+// FitMouv – Webhook Respond.io -> WhatsApp Cloud API -> IA OpenAI
+// (c) FitMouv 2025
+
+import express from "express";
+import axios from "axios";
+import bodyParser from "body-parser";
 
 const app = express();
+app.use(bodyParser.json());
 
-// Conserve le raw body si un jour on veut vérifier la signature Meta
-app.use(express.json({ limit: "1mb" }));
+// ====== ENV ======
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;           // Token système (long-lived) WABA
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;         // ex: "123456789012345"
+const TEMPLATE_NAME = process.env.TEMPLATE_NAME || "fitmouv_welcome"; // déjà créé en "french (simple)"
+const TEMPLATE_LANG  = process.env.TEMPLATE_LANG  || "french";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;           // clé OpenAI pour l’IA
+const OPENAI_MODEL   = process.env.OPENAI_MODEL  || "gpt-4o-mini";
 
-// --- Healthcheck
-app.get("/", (req, res) => res.status(200).send("OK"));
+// ====== UTILS ======
+const log = (...a) => console.log(...a);
+const WAPI = axios.create({
+  baseURL: `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}`,
+  headers: { Authorization: `Bearer ${WHATSAPP_TOKEN}` }
+});
 
-// --- Webhook unique : accepte soit notre payload Respond.io, soit le callback Meta
+// normalise FR: 06/07/… -> +33…
+function normalizeMsisdn(raw) {
+  if (!raw) return raw;
+  let s = (""+raw).replace(/\s+/g,"");
+  if (s.startsWith("+")) return s;
+  if (/^0[1-9]\d{8}$/.test(s)) return "+33" + s.slice(1);
+  return s;
+}
+
+// ====== IA ======
+async function replyWithAI(to, name, lastUserMsg, channel) {
+  if (!OPENAI_API_KEY) {
+    log("IA désactivée (OPENAI_API_KEY manquant) -> rien envoyé");
+    return;
+  }
+  const sys = `Tu es l'IA FitMouv. Tu parles en français simple, ton chill, précis, empathique.
+Règles: pas de gras, pas d'astérisques; parle au nom de "tes coachs".
+Contexte: coaching sport + nutrition par abonnement FitMouv.
+Objectif: aider la personne à avancer vers ses objectifs, poser 1-2 questions utiles max.
+Ne promets rien d’irréaliste.`;
+
+  const prompt = `Prénom: ${name || "là"}.
+Canal: ${channel || "WhatsApp"}.
+Message reçu: "${lastUserMsg}". 
+Réponds en 1 à 3 phrases maximum, ton humain et chaleureux.`;
+
+  const resp = await axios.post(
+    "https://api.openai.com/v1/chat/completions",
+    {
+      model: OPENAI_MODEL,
+      messages: [
+        { role: "system", content: sys },
+        { role: "user", content: prompt }
+      ]
+    },
+    { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` } }
+  );
+
+  const text = resp.data.choices?.[0]?.message?.content?.trim();
+  if (!text) {
+    log("IA: pas de contenu");
+    return;
+  }
+
+  await sendWhatsappText(to, text);
+}
+
+// ====== WHATSAPP SENDERS ======
+async function sendWhatsappText(to, text) {
+  return WAPI.post("/messages", {
+    messaging_product: "whatsapp",
+    to, type: "text",
+    text: { preview_url: false, body: text }
+  });
+}
+
+async function sendWelcomeTemplate(to, name) {
+  return WAPI.post("/messages", {
+    messaging_product: "whatsapp",
+    to,
+    type: "template",
+    template: {
+      name: TEMPLATE_NAME,
+      language: { code: TEMPLATE_LANG }, // "french" (simple)
+      components: name ? [{
+        type: "body",
+        parameters: [{ type: "text", text: name }]
+      }] : undefined
+    }
+  });
+}
+
+// ====== WEBHOOK RESPOND.IO ======
 app.post("/webhook", async (req, res) => {
   try {
-    // LOG centralisé
-    console.log("---- /webhook IN ----");
-    console.log(JSON.stringify(req.body, null, 2));
+    log("\n---- /webhook IN ----");
+    log(JSON.stringify(req.body, null, 2));
 
-    // Cas 1 : payload custom (depuis Respond.io → HTTP Request)
-    // attendu: { from: "+33759...", name: "Mohamed", message: "..." }
-    if (req.body && (req.body.from || req.body.message)) {
-      const { from, name, message } = req.body;
+    // Payload attendu depuis Respond.io (tu l’as déjà configuré)
+    const fromRaw   = req.body.de || req.body.from;
+    const name      = req.body.nom || req.body.name;
+    const message   = req.body.message || "";
+    const channel   = req.body.channel || req.body["channel.name"];
 
-      // TODO: ici on branchera OpenAI + envoi WhatsApp (quand on active la réponse)
-      // Pour l’instant on log juste proprement
-      console.log("Payload Respond.io → Render:", { from, name, message });
+    const to = normalizeMsisdn(fromRaw);
+    if (!to) { log("Numéro manquant"); return res.status(400).json({ ok:false }); }
 
-      return res.status(200).json({ ok: true, source: "respondio" });
+    // Tentative d’envoi direct (fenêtre ouverte)
+    try {
+      if (message && message !== "{{message.text}}") {
+        await replyWithAI(to, name, message, channel);
+      } else {
+        // Si pas de message utilisateur (ex: trigger "Conversation ouverte"), envoie un micro ping neutre
+        await sendWhatsappText(to, "Salut, bien reçu. Tes coachs te répondent ici 👍");
+      }
+      log("Envoi texte OK (fenêtre ouverte).");
+    } catch (e) {
+      const code = e?.response?.data?.error?.code;
+      const sub  = e?.response?.data?.error?.error_subcode;
+      const msg  = e?.response?.data?.error?.message;
+      log("Erreur envoi texte:", code, sub, msg);
+
+      // 470 = outside 24h window
+      if (code === 470 || sub === 2018001 || (msg||"").includes("outside the 24 hour window")) {
+        log("Fenêtre fermée -> envoi du template d’ouverture…");
+        await sendWelcomeTemplate(to, name || "là 👋");
+      } else {
+        throw e;
+      }
     }
 
-    // Cas 2 : callback Meta (Cloud API → App Webhooks)
-    // structure: { object: 'whatsapp_business_account', entry: [...] }
-    if (req.body && req.body.object === "whatsapp_business_account") {
-      // On ne traite pas encore, on log seulement
-      return res.status(200).send("EVENT_RECEIVED");
-    }
-
-    // Inconnu mais on répond 200 pour éviter les retries
-    return res.status(200).json({ ok: true, note: "payload inconnu loggé" });
-  } catch (e) {
-    console.error("Webhook error:", e);
-    return res.status(500).json({ ok: false });
+    return res.json({ ok: true });
+  } catch (err) {
+    log("Webhook ERROR:", err?.response?.data || err);
+    return res.status(500).json({ ok:false });
   }
 });
 
-// 404 propre
-app.use((req, res) => res.status(404).json({ error: "Not found" }));
+app.get("/health", (req,res)=>res.send("ok"));
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server up on :${PORT}`);
+app.listen(PORT, () => {
+  log("===============================================");
+  log("🚀 Serveur opérationnel sur :", PORT);
+  log(`🌐 URL principale : https://whatsapp-bot-v98u.onrender.com`);
+  log("===============================================");
 });
