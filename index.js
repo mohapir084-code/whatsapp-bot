@@ -11,6 +11,8 @@ app.use(bodyParser.json());
 
 // --- en haut du fichier (après app.use(express.json())) ---
 const pausedContacts = new Set(); // mémorise les contacts en pause
+// mémoire simple côté serveur pour l'historique par contact
+const contacts = new Map(); // <— AJOUTER CECI
 
 // ====== ENV ======
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;           // Token système (long-lived) WABA
