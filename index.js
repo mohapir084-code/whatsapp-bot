@@ -9,6 +9,9 @@ import bodyParser from "body-parser";
 const app = express();
 app.use(bodyParser.json());
 
+// --- en haut du fichier (après app.use(express.json())) ---
+const pausedContacts = new Set(); // mémorise les contacts en pause
+
 // ====== ENV ======
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;           // Token système (long-lived) WABA
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;         // ex: "123456789012345"
@@ -96,11 +99,48 @@ async function sendWelcomeTemplate(to, name) {
   });
 }
 
+// =====================
+// ===  /control  ======
+// =====================
+app.post("/control", (req, res) => {
+  const { action, contact_id, contact_phone, contact_name } = req.body || {};
+  const key = contact_id || contact_phone;
+
+  if (!action || !key) {
+    console.log("[CONTROL] Requête invalide:", req.body);
+    return res.status(400).json({ error: "action et contact_id ou contact_phone requis" });
+  }
+
+  if (action === "pause") {
+    pausedContacts.add(key);
+    console.log("=== CONTROL: PAUSE ===", { key, contact_name });
+    return res.json({ ok: true, paused: true, key });
+  }
+
+  if (action === "resume") {
+    pausedContacts.delete(key);
+    console.log("=== CONTROL: RESUME ===", { key, contact_name });
+    return res.json({ ok: true, paused: false, key });
+  }
+
+  console.log("[CONTROL] Action inconnue:", action);
+  return res.status(400).json({ error: 'action doit être "pause" ou "resume"' });
+});
+
 // ====== WEBHOOK RESPOND.IO ======
 app.post("/webhook", async (req, res) => {
   try {
     log("\n---- /webhook IN ----");
     log(JSON.stringify(req.body, null, 2));
+
+    // Vérifie si le contact est en pause (tag "pause_ai" actif)
+const contactKey = req.body.contact_id || req.body.from || req.body.contact_phone;
+
+if (contactKey && pausedContacts.has(contactKey)) {
+  console.log("AI PAUSED for", contactKey, "→ aucune auto-réponse.");
+  return res.json({ ok: true, skipped: "paused" });
+}
+    
 
     // Payload attendu depuis Respond.io (tu l’as déjà configuré)
     const fromRaw   = req.body.de || req.body.from;
