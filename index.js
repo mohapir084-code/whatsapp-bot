@@ -182,6 +182,37 @@ if (contactKey && pausedContacts.has(contactKey)) {
   }
 });
 
+// === ENDPOINT POUR LES NOTES COACHS ===
+app.post('/note', (req, res) => {
+  try {
+    const { contact_id, contact_phone, note } = req.body || {};
+    const key = contact_id || contact_phone;
+    if (!key || !note || !note.trim()) {
+      return res.status(400).json({ ok: false, error: 'missing key or note' });
+    }
+
+    // récupère la fiche du contact ou crée une nouvelle entrée
+    const c = contacts.get(key) || { history: [] };
+    c.history = c.history || [];
+
+    // ajoute la note comme si c'était l'IA elle-même
+    c.history.push({
+      role: 'assistant',
+      text: `[Note coach] ${note.trim()}`,
+      at: Date.now(),
+      by: 'coach'
+    });
+
+    contacts.set(key, c);
+
+    console.log('NOTE IA intégrée pour', key, '=>', note);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('/note error:', e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 app.get("/health", (req,res)=>res.send("ok"));
 
 const PORT = process.env.PORT || 10000;
